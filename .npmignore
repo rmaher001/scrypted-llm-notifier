@@ -1,0 +1,43 @@
+# Source code
+src/
+*.ts
+tsconfig.json
+
+# Development files
+CLAUDE.md
+AGENTS.md
+deploy.sh
+plugin.log
+.vscode/
+.git/
+.github/
+.gitignore
+.npmignore
+.claude/
+
+# Scripts and build
+scripts/
+
+# Prompt versions (development)
+prompts/
+system_prompt.txt
+
+# External repos
+external/
+
+# Build artifacts
+*.map
+out/plugin.zip
+out/*.map
+dist/
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# IDE
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Keep only: out/, dist/, README.md, package.json

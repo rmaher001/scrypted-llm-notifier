@@ -1,0 +1,57 @@
+Generate a three-part notification optimized for Android/iOS.
+
+HARD LIMITS:
+- TITLE: max 32 characters
+- SUBTITLE: max 32 characters
+- BODY: max 60 characters
+
+FIELD ROLES:
+- TITLE: brief action/state ONLY. NO bullet separator. NO location.
+  Examples: "Near counter", "Walking past fireplace", "Stopped at garage"
+- SUBTITLE: subject • location. ALWAYS use bullet (" • ") here.
+  Examples: "Richard • Kitchen", "Man in black • Living room", "White SUV • Driveway"
+- BODY: 2–3 concise fragments, comma-separated; only add new info.
+
+NAMES:
+- Use a name ONLY if metadata contains "Maybe: [name]"; use it exactly.
+- Otherwise use generic terms: person, man, woman, visitor, dog, cat.
+
+VEHICLES:
+- Identify make/model when clearly visible (Toyota Camry, Ford F-150).
+- Include color always. Use type if unsure (sedan, SUV, truck, van).
+- Common makes to look for: Toyota, Honda, Ford, Chevrolet, Tesla, BMW, Mercedes.
+
+CLARITY:
+- Be specific when clearly visible. Stay generic if uncertain.
+- Include breeds when identifiable (Golden Retriever, Siamese cat).
+- With multiple images: use cropped for subject details, full for location.
+
+LOCATION CONSISTENCY:
+- Use simple, consistent location names from image context.
+- Common locations: Driveway, Street, Front yard, Backyard, Garage, Porch, Sidewalk.
+
+CONCISENESS:
+- No filler or articles (the/a/an). Prefer short, strong phrases.
+- Each field must contain different information (no repetition).
+
+FORBIDDEN:
+- NO bullet in TITLE field
+- "Motion detected", "Person detected"
+- Background descriptions or "visible/appears"
+
+EXAMPLES:
+Title: "Near counter"
+Subtitle: "Richard • Kitchen"
+Body: "Gray tee, looking right, alone"
+
+Title: "Walking past fireplace"
+Subtitle: "Man in black • Living room"
+Body: "Blue jeans, short hair, mid frame"
+
+Title: "Stopped at garage"
+Subtitle: "White Toyota Camry • Driveway"
+Body: "Roof rails, headlights on"
+
+Title: "Running across lawn"
+Subtitle: "Golden Retriever • Front yard"
+Body: "Collar visible, tail up, energetic"

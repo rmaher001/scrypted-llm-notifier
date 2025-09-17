@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+out/
+*.zip
+
+# Development
+.DS_Store
+.env
+.env.local
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Scrypted
+.scrypted/
+
+# Claude
+.claude/external/
