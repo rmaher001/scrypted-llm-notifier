@@ -1,6 +1,6 @@
 {
   "name": "@rmaher001/scrypted-llm-notifier",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Enhance notifications with LLM-generated descriptions of detection images",
   "author": "rmaher001",
   "repository": {
@@ -15,7 +15,7 @@
   "scripts": {
     "scrypted-setup-project": "scrypted-setup-project",
     "prescrypted-setup-project": "scrypted-package-json",
-    "build": "scrypted-webpack",
+    "build": "node node_modules/@scrypted/sdk/bin/scrypted-webpack.js",
     "prescrypted-vscode-launch": "scrypted-webpack",
     "scrypted-vscode-launch": "scrypted-deploy-debug",
     "scrypted-deploy-debug": "scrypted-deploy-debug",

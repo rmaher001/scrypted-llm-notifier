@@ -14,10 +14,10 @@ In Scrypted, search for and install: `scrypted-llm-notifier`
 - Advanced
   - Enable LLM Enhancement: On
   - Snapshot Mode:
-    - Cropped: zoomed subject; fastest
+    - Cropped (default): zoomed subject; fastest, best for quick processing
     - Full: full frame for scene context
-    - Both (default): full + cropped
-      - Why Both: full frame drives location/scene; cropped adds clear subject details (auto‑downscaled for speed)
+    - Both: full + cropped (best accuracy but slower)
+      - Note: 'Both' mode may cause timeouts with multiple concurrent notifications on local LLMs
   - LLM Timeout (sec): 90
   - Include Original Message: On (preserves face recognition names from notifications)
 

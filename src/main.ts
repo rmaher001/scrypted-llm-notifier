@@ -294,7 +294,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             description: 'Which image(s) to send to the LLM',
             type: 'string',
             choices: ['cropped', 'full', 'both'],
-            defaultValue: 'both',
+            defaultValue: 'cropped',
             group: 'Advanced',
         },
         llmTimeoutMs: {
