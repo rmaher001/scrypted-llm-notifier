@@ -27,8 +27,8 @@ external/
 
 # Build artifacts
 *.map
-out/*.map
-dist/
+out/
+dist/*.map
 node_modules/
 npm-debug.log*
 package-lock.json
