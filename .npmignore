@@ -27,7 +27,6 @@ external/
 
 # Build artifacts
 *.map
-out/plugin.zip
 out/*.map
 dist/
 node_modules/
