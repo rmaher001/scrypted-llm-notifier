@@ -78,14 +78,25 @@ function buildImageList(mode: string, full?: string, cropped?: string): string[]
  * Preserves known person names from notifications
  */
 
-function createMessageTemplate(systemPrompt: string, imageUrls: string[], metadata: any) {
-    const schema = "CRITICAL: The response must be in JSON format with a message 'title', 'subtitle', and 'body'. The title and subtitle must be EXACTLY 32 characters or less. The body must be EXACTLY 60 characters or less. Any response exceeding these limits is invalid.";
-    
+function createMessageTemplate(userPrompt: string, imageUrls: string[], metadata: any) {
+    // Hardcoded base prompt with structural requirements
+    const basePrompt = `Analyze the security camera image and generate a notification.
+
+CRITICAL RULES (DO NOT VIOLATE):
+1. If metadata contains "Maybe: [name]", you MUST use that EXACT name in the title
+2. Title format MUST be: "[Person/Object] at [location]"
+3. Some platforms only show title+body - put ALL critical info there
+4. Each field MUST contain different information - no repetition between fields
+5. Response MUST be valid JSON with exactly three fields: title, subtitle, body
+6. If using a person's name in title, use the same name in body - never switch to generic terms`;
+
+    const schema = "CRITICAL: The response must be in JSON format with a message 'title', 'subtitle', and 'body'. The title and subtitle must be EXACTLY 32 characters or less. The body must be EXACTLY 80 characters or less. Any response exceeding these limits is invalid.";
+
     return {
         messages: [
             {
                 role: "system",
-                content: systemPrompt + ' ' + schema,
+                content: basePrompt + '\n\n' + userPrompt + '\n\n' + schema,
             },
             {
                 role: "user",
@@ -233,7 +244,7 @@ class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
         }
 
         const messageTemplate = createMessageTemplate(
-            this.llmProvider.storageSettings.values.systemPrompt,
+            this.llmProvider.storageSettings.values.userPrompt,
             imageUrls,
             metadata
         );
@@ -267,7 +278,7 @@ class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
             // Update options with LLM-generated content
             options ||= {};
             options.body = body;
-            options.subtitle = subtitle;
+            options.subtitle = subtitle;  // For iOS and Scrypted UI (not shown on Android HA)
 
             return await this.mixinDevice.sendNotification(newTitle, options, media, icon);
         }
@@ -312,67 +323,31 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             multiple: true,
             group: 'General',
         },
-        systemPrompt: {
-            title: 'System Prompt',
+        userPrompt: {
+            title: 'Notification Style',
             type: 'textarea',
-            description: 'The system prompt used to generate the notification.',
-            defaultValue: `Generate a three-part notification optimized for Android/iOS.
+            description: 'Customize how notifications describe detections. You can adjust locations, emphasis, and level of detail.',
+            defaultValue: `STYLE PREFERENCES:
 
-HARD LIMITS:
-- TITLE: max 32 characters
-- SUBTITLE: max 32 characters
-- BODY: max 60 characters
+Title: Include person names, vehicle details, or animal breeds when identifiable
+- For vehicles: Include license plate if clearly visible (e.g., "White Camry ABC123")
 
-FIELD ROLES:
-- TITLE: brief action/state ONLY. NO bullet separator. NO location.
-  Examples: "Near counter", "Walking past fireplace", "Stopped at garage"
-- SUBTITLE: subject • location. ALWAYS use bullet (" • ") here.
-  Examples: "Richard • Kitchen", "Man in black • Living room", "White SUV • Driveway"
-- BODY: 2–3 concise fragments, comma-separated; only add new info.
+Subtitle: Category marker
+- Format: "[Type] • [Area]"
+- Examples: "Person • Indoor", "Vehicle • Street"
 
-NAMES:
-- Use a name ONLY if metadata contains "Maybe: [name]"; use it exactly.
-- Otherwise use generic terms: person, man, woman, visitor, dog, cat.
+Body: Focus on actions and key visual details
+- Describe what's happening in the scene
+- Include relevant clothing, objects, or movements
+- Include license plate in body if visible but not in title
+- Examples:
+  "Walking toward garage while checking phone and carrying a shopping bag"
+  "White sedan with plate XYZ789 pulling slowly into space with headlights on"
+  "Tall figure in blue jacket with package approaching and ringing doorbell"
 
-VEHICLES:
-- Identify make/model when clearly visible (Toyota Camry, Ford F-150).
-- Include color always. Use type if unsure (sedan, SUV, truck, van).
-- Common makes to look for: Toyota, Honda, Ford, Chevrolet, Tesla, BMW, Mercedes.
+Common locations: driveway, street, kitchen, living room, front door, yard, garage
 
-CLARITY:
-- Be specific when clearly visible. Stay generic if uncertain.
-- Include breeds when identifiable (Golden Retriever, Siamese cat).
-- With multiple images: use cropped for subject details, full for location.
-
-LOCATION CONSISTENCY:
-- Use simple, consistent location names from image context.
-- Common locations: Driveway, Street, Front yard, Backyard, Garage, Porch, Sidewalk.
-
-CONCISENESS:
-- No filler or articles (the/a/an). Prefer short, strong phrases.
-- Each field must contain different information (no repetition).
-
-FORBIDDEN:
-- NO bullet in TITLE field
-- "Motion detected", "Person detected"
-- Background descriptions or "visible/appears"
-
-EXAMPLES:
-Title: "Near counter"
-Subtitle: "Richard • Kitchen"
-Body: "Gray tee, looking right, alone"
-
-Title: "Walking past fireplace"
-Subtitle: "Man in black • Living room"
-Body: "Blue jeans, short hair, mid frame"
-
-Title: "Stopped at garage"
-Subtitle: "White Toyota Camry • Driveway"
-Body: "Roof rails, headlights on"
-
-Title: "Running across lawn"
-Subtitle: "Golden Retriever • Front yard"
-Body: "Collar visible, tail up, energetic"`,
+Avoid generic phrases like "motion detected" or "person detected"`,
             group: 'General',
         },
         includeOriginalMessage: {
@@ -394,7 +369,7 @@ Body: "Collar visible, tail up, energetic"`,
         const orderedKeys = [
             // General first
             'chatCompletions',
-            'systemPrompt',
+            'userPrompt',
             // Options (Advanced)
             'enabled',
             'llmTimeoutMs',
