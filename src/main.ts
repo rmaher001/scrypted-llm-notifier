@@ -83,12 +83,15 @@ function createMessageTemplate(userPrompt: string, imageUrls: string[], metadata
     const basePrompt = `Analyze the security camera image and generate a notification.
 
 CRITICAL RULES (DO NOT VIOLATE):
-1. If metadata contains "Maybe: [name]", you MUST use that EXACT name in the title
-2. Title format MUST be: "[Person/Object] at [location]"
-3. Some platforms only show title+body - put ALL critical info there
-4. Each field MUST contain different information - no repetition between fields
-5. Response MUST be valid JSON with exactly three fields: title, subtitle, body
-6. If using a person's name in title, use the same name in body - never switch to generic terms`;
+1. ONLY use names if metadata contains "Maybe: [name]" - use that EXACT name WITHOUT "Maybe:"
+2. If NO name in metadata, use generic terms: Person, Man, Woman, Visitor
+3. NEVER make up names like John, Sarah, etc. - only use names from metadata
+4. NEVER include "Maybe:" in your response - only use the actual name
+5. Title format MUST be: "[Person/Object] at [location]"
+6. Some platforms only show title+body - put ALL critical info there
+7. Each field MUST contain different information - no repetition between fields
+8. Response MUST be valid JSON with exactly three fields: title, subtitle, body
+9. If using a person's name in title, use the same name in body - never switch to generic terms`;
 
     const schema = "CRITICAL: The response must be in JSON format with a message 'title', 'subtitle', and 'body'. The title and subtitle must be EXACTLY 32 characters or less. The body must be EXACTLY 80 characters or less. Any response exceeding these limits is invalid.";
 
@@ -329,7 +332,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             description: 'Customize how notifications describe detections. You can adjust locations, emphasis, and level of detail.',
             defaultValue: `STYLE PREFERENCES:
 
-Title: Include person names, vehicle details, or animal breeds when identifiable
+Title: Include person names ONLY when provided in metadata, otherwise use generic terms
+- When name known: "Richard at front door"
+- When name unknown: "Person at front door"
 - For vehicles: Include license plate if clearly visible (e.g., "White Camry ABC123")
 
 Subtitle: Category marker

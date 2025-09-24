@@ -1,6 +1,6 @@
 {
   "name": "@rmaher001/scrypted-llm-notifier",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Enhance notifications with LLM-generated descriptions of detection images",
   "author": "rmaher001",
   "repository": {
