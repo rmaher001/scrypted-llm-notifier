@@ -1,22 +1,23 @@
-import sdk, { 
+import sdk, {
     ChatCompletion,
-    MediaObject, 
-    MixinDeviceBase, 
-    MixinProvider, 
-    Notifier, 
+    MediaObject,
+    MixinDeviceBase,
+    MixinProvider,
+    Notifier,
     NotifierOptions,
     ScryptedDevice,
-    ScryptedDeviceBase, 
-    ScryptedDeviceType, 
+    ScryptedDeviceBase,
+    ScryptedDeviceType,
     ScryptedInterface,
     Settings,
     SettingValue,
-    WritableDeviceState 
+    WritableDeviceState
 } from '@scrypted/sdk';
 const { StorageSettings } = require('@scrypted/sdk/storage-settings');
 
 const { mediaManager } = sdk;
 import jpeg from 'jpeg-js';
+import { LRUCache } from 'lru-cache';
 
 function withTimeout<T>(p: Promise<T>, ms: number, label?: string): Promise<T> {
     let to: NodeJS.Timeout;
@@ -86,14 +87,15 @@ CRITICAL RULES (DO NOT VIOLATE):
 1. ONLY use names if metadata contains "Maybe: [name]" - use that EXACT name WITHOUT "Maybe:"
 2. If NO name in metadata, use generic terms: Person, Man, Woman, Visitor
 3. NEVER make up names like John, Sarah, etc. - only use names from metadata
-4. NEVER include "Maybe:" in your response - only use the actual name
-5. Title format MUST be: "[Person/Object] at [location]"
-6. Some platforms only show title+body - put ALL critical info there
-7. Each field MUST contain different information - no repetition between fields
-8. Response MUST be valid JSON with exactly three fields: title, subtitle, body
-9. If using a person's name in title, use the same name in body - never switch to generic terms`;
+4. NEVER make up license plates like ABC123, XYZ789, etc. - only mention actual visible plates or "partially visible plate"
+5. NEVER include "Maybe:" in your response - only use the actual name
+6. Title format MUST be: "[Person/Object] at [location]"
+7. Some platforms only show title+body - put ALL critical info there
+8. Each field MUST contain different information - no repetition between fields
+9. Response MUST be valid JSON with exactly three fields: title, subtitle, body
+10. If using a person's name in title, use the same name in body - never switch to generic terms`;
 
-    const schema = "CRITICAL: The response must be in JSON format with a message 'title', 'subtitle', and 'body'. The title and subtitle must be EXACTLY 32 characters or less. The body must be EXACTLY 80 characters or less. Any response exceeding these limits is invalid.";
+    const schema = "CRITICAL CHARACTER LIMITS - STRICTLY ENFORCE:\n- Title: MAXIMUM 32 characters (count every letter, space, punctuation)\n- Subtitle: MAXIMUM 32 characters (count every letter, space, punctuation)\n- Body: MAXIMUM 75 characters (count every letter, space, punctuation)\n\nYou MUST count characters before responding. Responses exceeding these limits will be REJECTED and cause system failure. If your description is too long, use shorter words and remove unnecessary details. The body character limit of 75 is ABSOLUTE and NON-NEGOTIABLE.";
 
     return {
         messages: [
@@ -252,40 +254,154 @@ class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
             metadata
         );
 
-        try {
-            const device = this.llmProvider.selectProvider();
+        // Track duplicate detections to analyze caching opportunities
+        const re = (options as any)?.recordedEvent;
+        const data = re?.data || {};
+        const detectionId = data?.detectionId || data?.detections?.[0]?.id;
 
+        if (detectionId) {
+            const key = `${detectionId}:${snapshotMode}`;
+            const text = `${title}|${options?.subtitle || ''}|${options?.body || ''}`;
+
+            const existing = this.llmProvider.detectionTracker.get(key);
+            if (existing) {
+                existing.count++;
+                if (existing.text !== text) {
+                    this.console.warn(`⚠️  Detection key reused with DIFFERENT text:\n  Key: ${key}\n  Previous: "${existing.text}"\n  Current:  "${text}"`);
+                } else {
+                    this.console.log(`✓ Duplicate detection #${existing.count} (identical text): ${key}`);
+                }
+            } else {
+                this.llmProvider.detectionTracker.set(key, {text, count: 1});
+                this.console.log(`🔍 New detection: ${key}`);
+            }
+        }
+
+        // Check response cache before calling LLM
+        let newTitle: string;
+        let subtitle: string;
+        let body: string;
+
+        try {
+            if (detectionId) {
+            const cacheKey = `${detectionId}:${snapshotMode}`;
+            const cached = this.llmProvider.responseCache.get(cacheKey);
+
+            if (cached) {
+                this.console.log(`💾 Cache HIT: ${cacheKey}`);
+                newTitle = cached.title;
+                subtitle = cached.subtitle;
+                body = cached.body;
+            } else {
+                // Check if another request is already in-flight for this key
+                const inFlight = this.llmProvider.inFlightRequests.get(cacheKey);
+
+                if (inFlight) {
+                    this.console.log(`⏳ Waiting for in-flight request: ${cacheKey}`);
+                    const result = await inFlight;
+                    newTitle = result.title;
+                    subtitle = result.subtitle;
+                    body = result.body;
+                } else {
+                    this.console.log(`❌ Cache MISS: ${cacheKey}`);
+
+                    // Create and store the promise before starting the LLM call
+                    const llmPromise = (async () => {
+                        const start = Date.now();
+                        const device = this.llmProvider.selectProvider();
+                        const timeoutSec = (this.llmProvider.storageSettings.values as any).llmTimeoutMs ?? 90;
+                        const llmTimeout = Math.max(1, Number(timeoutSec)) * 1000;
+                        this.console.log(`Calling LLM (timeout ${llmTimeout}ms)...`);
+
+                        try {
+                            const llmData = await withTimeout(device.getChatCompletion(messageTemplate as any), llmTimeout, 'LLM request');
+                            const responseTime = Date.now() - start;
+                            const responseTimeSeconds = Math.round(responseTime / 1000);
+
+                            const content = llmData.choices[0].message.content;
+                            if (!content) {
+                                throw new Error('Empty response from LLM');
+                            }
+                            const json = JSON.parse(content);
+                            this.console.log('LLM response:', json);
+
+                            const result = {
+                                title: json.title,
+                                subtitle: json.subtitle,
+                                body: json.body
+                            };
+
+                            if (typeof result.title !== 'string' || typeof result.subtitle !== 'string' || typeof result.body !== 'string') {
+                                throw new Error('Invalid response format from LLM');
+                            }
+
+                            // Store in cache
+                            this.llmProvider.responseCache.set(cacheKey, result);
+
+                            // Log all stats together
+                            this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Inference: ${responseTimeSeconds}s, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
+
+                            return result;
+                        } finally {
+                            // Clean up in-flight map
+                            this.llmProvider.inFlightRequests.delete(cacheKey);
+                        }
+                    })();
+
+                    // Store the promise immediately so other concurrent requests can await it
+                    this.llmProvider.inFlightRequests.set(cacheKey, llmPromise);
+
+                    // Await the result
+                    const result = await llmPromise;
+                    newTitle = result.title;
+                    subtitle = result.subtitle;
+                    body = result.body;
+                }
+            }
+        } else {
+            // No detectionId, must call LLM
+            this.console.log(`⚠️  No detectionId, skipping cache`);
             const start = Date.now();
+            const device = this.llmProvider.selectProvider();
             const timeoutSec = (this.llmProvider.storageSettings.values as any).llmTimeoutMs ?? 90;
             const llmTimeout = Math.max(1, Number(timeoutSec)) * 1000;
             this.console.log(`Calling LLM (timeout ${llmTimeout}ms)...`);
-            const data = await withTimeout(device.getChatCompletion(messageTemplate as any), llmTimeout, 'LLM request');
-            const responseTime = Date.now() - start;
-            const responseTimeSeconds = Math.round(responseTime / 1000);
-            
-            const content = data.choices[0].message.content;
-            if (!content) {
-                throw new Error('Empty response from LLM');
+
+            try {
+                const llmData = await withTimeout(device.getChatCompletion(messageTemplate as any), llmTimeout, 'LLM request');
+                const responseTime = Date.now() - start;
+                const responseTimeSeconds = Math.round(responseTime / 1000);
+
+                const content = llmData.choices[0].message.content;
+                if (!content) {
+                    throw new Error('Empty response from LLM');
+                }
+                const json = JSON.parse(content);
+                this.console.log('LLM response:', json);
+
+                newTitle = json.title;
+                subtitle = json.subtitle;
+                body = json.body;
+
+                if (typeof newTitle !== 'string' || typeof subtitle !== 'string' || typeof body !== 'string') {
+                    throw new Error('Invalid response format from LLM');
+                }
+
+                // Log all stats together
+                this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Inference: ${responseTimeSeconds}s, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
+            } catch (e) {
+                throw e; // Re-throw to outer catch block
             }
-            const json = JSON.parse(content);
-            this.console.log('LLM response:', json);
-            
-            const { title: newTitle, subtitle, body } = json;
-
-            if (typeof newTitle !== 'string' || typeof subtitle !== 'string' || typeof body !== 'string')
-                throw new Error('Invalid response format from LLM');
-
-            // Log all stats together
-            this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Inference: ${responseTimeSeconds}s, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
+            }
 
             // Update options with LLM-generated content
             options ||= {};
             options.body = body;
             options.subtitle = subtitle;  // For iOS and Scrypted UI (not shown on Android HA)
+            options.bodyWithSubtitle = body;  // Required for iOS to display body when subtitle is present
 
             return await this.mixinDevice.sendNotification(newTitle, options, media, icon);
-        }
-        catch (e) {
+        } catch (e) {
             this.console.warn('LLM enhancement failed, using original notification:', e);
             return await this.mixinDevice.sendNotification(title, options, media, icon);
         }
@@ -294,7 +410,16 @@ class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
 
 export default class LLMNotifierProvider extends ScryptedDeviceBase implements MixinProvider, Settings {
     private currentProviderIndex = 0;
-    
+    detectionTracker = new LRUCache<string, {text: string, count: number}>({
+        max: 100,
+        ttl: 1000 * 60 * 30, // 30 minutes - longer TTL to see more detections
+    });
+    responseCache = new LRUCache<string, {title: string, subtitle: string, body: string}>({
+        max: 1000,
+        ttl: 1000 * 60 * 5, // 5 minutes
+    });
+    inFlightRequests = new Map<string, Promise<{title: string, subtitle: string, body: string}>>();
+
     storageSettings = new StorageSettings(this, {
         enabled: {
             title: 'Enable LLM Enhancement',
@@ -329,13 +454,13 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         userPrompt: {
             title: 'Notification Style',
             type: 'textarea',
-            description: 'Customize how notifications describe detections. You can adjust locations, emphasis, and level of detail.',
+            description: 'Customize how notifications describe detections. v12 improvements available in README.',
             defaultValue: `STYLE PREFERENCES:
 
 Title: Include person names ONLY when provided in metadata, otherwise use generic terms
 - When name known: "Richard at front door"
 - When name unknown: "Person at front door"
-- For vehicles: Include license plate if clearly visible (e.g., "White Camry ABC123")
+- For vehicles: Include make/model and license plate only if clearly visible
 
 Subtitle: Category marker
 - Format: "[Type] • [Area]"
@@ -344,10 +469,10 @@ Subtitle: Category marker
 Body: Focus on actions and key visual details
 - Describe what's happening in the scene
 - Include relevant clothing, objects, or movements
-- Include license plate in body if visible but not in title
+- For vehicles: Include make, model, and license plate details when visible
 - Examples:
   "Walking toward garage while checking phone and carrying a shopping bag"
-  "White sedan with plate XYZ789 pulling slowly into space with headlights on"
+  "White Tesla Model 3 (ABC123) pulling slowly into driveway"
   "Tall figure in blue jacket with package approaching and ringing doorbell"
 
 Common locations: driveway, street, kitchen, living room, front door, yard, garage
@@ -374,6 +499,7 @@ Avoid generic phrases like "motion detected" or "person detected"`,
         const orderedKeys = [
             // General first
             'chatCompletions',
+            'promptUpdateInfo',
             'userPrompt',
             // Options (Advanced)
             'enabled',

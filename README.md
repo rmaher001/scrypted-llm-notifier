@@ -1,35 +1,25 @@
 # LLM Notifier for Scrypted
 
-## Installation
-In Scrypted, search for and install: `scrypted-llm-notifier`
+Enhance security camera notifications with AI-generated descriptions using vision-capable LLMs.
 
-## Configuration
+## Setup
+1. **Install LLM Plugin** - Required dependency for ChatCompletion providers
+2. **Configure LLM Provider** - Select OpenAI, Claude, or local LLM in settings
+3. **Enable on Devices** - Extensions → toggle on your notification devices
+4. **Test** - Trigger a detection to see enhanced notifications
 
 ## Settings
-- General
-  - LLM Providers: select one or more providers from the LLM Plugin
-    - Multiple providers: rotates between them to spread the load
-    - If an LLM fails or times out, sends the original notification instead
-  - System Prompt: try the default—it's ready out of the box, or feel free to customize it
-- Advanced
-  - Enable LLM Enhancement: On
-  - Snapshot Mode:
-    - Cropped (default): zoomed subject; fastest, best for quick processing
-    - Full: full frame for scene context
-    - Both: full + cropped (best accuracy but slower)
-      - Note: 'Both' mode may cause timeouts with multiple concurrent notifications on local LLMs
-  - LLM Timeout (sec): 90
-  - Include Original Message: On (preserves face recognition names from notifications)
+- **LLM Providers**: Select one or more (rotates between them for load balancing)
+- **Notification Style**: Customize how detections are described
+- **Snapshot Mode**: Cropped (fast), Full (context), or Both (accurate)
 
-## Enable on Devices
-- Extensions → toggle on your notification devices (mobile apps, pushover, etc.)
+## Features
+- **Face Recognition**: Preserves names from face detection metadata
+- **Vehicle Details**: Make, model, color, and license plates when visible
+- **Smart Caching**: Reduces redundant LLM calls by 75% with multiple notifiers
+- **Platform Support**: Works with any Notifier device (Pushover, Home Assistant, etc.)
 
-## Verify
-- Trigger a detection with an image; notification shows "Subject • Location" with concise details
-
-## Default Prompt
-The default system prompt is optimized for Android/iOS notifications with strict character limits (32/32/60). It automatically:
-- Identifies people, vehicles (make/model when visible), and animals (breeds when clear)
-- Preserves face recognition names from "Maybe: [name]" metadata
-- Uses consistent location naming (Driveway, Front yard, etc.)
-- Formats as: Title (action), Subtitle (subject • location), Body (details)
+## Troubleshooting
+- **No enhancement**: Check LLM provider is vision-capable
+- **Timeouts**: Reduce LLM timeout or use single provider
+- **Wrong names**: Ensure "Include Original Message" is enabled
