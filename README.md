@@ -16,7 +16,7 @@ Enhance security camera notifications with AI-generated descriptions using visio
 ## Features
 - **Face Recognition**: Preserves names from face detection metadata
 - **Vehicle Details**: Make, model, color, and license plates when visible
-- **Smart Caching**: Reduces redundant LLM calls by 75% with multiple notifiers
+- **Smart Caching**: Reduces redundant LLM calls when using multiple notifiers
 - **Platform Support**: Works with any Notifier device (Pushover, Home Assistant, etc.)
 
 ## Troubleshooting
