@@ -1,424 +1,1401 @@
 import sdk, {
     ChatCompletion,
-    MediaObject,
-    MixinDeviceBase,
+    HttpRequest,
+    HttpRequestHandler,
+    HttpResponse,
     MixinProvider,
     Notifier,
-    NotifierOptions,
+    RTCSignalingChannel,
     ScryptedDevice,
     ScryptedDeviceBase,
     ScryptedDeviceType,
     ScryptedInterface,
+    ScryptedMimeTypes,
     Settings,
     SettingValue,
+    VideoRecorder,
     WritableDeviceState
 } from '@scrypted/sdk';
 const { StorageSettings } = require('@scrypted/sdk/storage-settings');
 
-const { mediaManager } = sdk;
-import jpeg from 'jpeg-js';
+const { mediaManager, endpointManager } = sdk;
 import { LRUCache } from 'lru-cache';
+import { WebRTCSignalingSession } from './webrtc';
+import { withTimeout, resizeJpegNearest, getJpegDimensions } from './utils';
 
-function withTimeout<T>(p: Promise<T>, ms: number, label?: string): Promise<T> {
-    let to: NodeJS.Timeout;
-    const timeout = new Promise<T>((_, reject) => {
-        to = setTimeout(() => reject(new Error(`${label || 'operation'} timed out after ${ms}ms`)), ms);
-    });
-    return Promise.race([p, timeout]).finally(() => clearTimeout(to!)) as Promise<T>;
-}
+import {
+    StoredNotification,
+    NarrativeSegment,
+    DailyBriefData,
+    FrozenSegment,
+    CandidateWithPriority
+} from './types';
+import { NotificationStore } from './notification-store';
+import { buildCachedHighlights } from './daily-brief/highlights';
+import { createTimeBuckets, isVehicleNotification, selectCandidatesFromBuckets } from './daily-brief/candidate-selection';
+import { getNaturalPeriods, matchSegmentToPeriod, buildFrozenContext, createSummaryPrompt } from './daily-brief/prompts';
+import { generateDailyBriefHTML, getHACardBundle } from './daily-brief/html-generator';
+import { LLMNotifier } from './llm-notifier';
+import { PosterStore } from './poster-store';
+import { handleGalleryDataRequest, handleGallerySearchRequest, handleThumbnailRequest, findTextEmbeddingProvider } from './gallery';
 
-// Local JPEG resize (nearest-neighbor) for full-frame downscale
-async function resizeJpegNearest(input: Buffer, targetWidth: number, quality = 60): Promise<Buffer> {
-    const { data: src, width: sw, height: sh } = jpeg.decode(input, { useTArray: true });
-    if (!sw || !sh)
-        return input;
-    const dw = Math.min(targetWidth, sw);
-    if (dw === sw)
-        return input;
-    const dh = Math.max(1, Math.round((sh * dw) / sw));
-    const dst = Buffer.allocUnsafe(dw * dh * 4);
-    for (let y = 0; y < dh; y++) {
-        const sy = Math.floor((y * sh) / dh);
-        for (let x = 0; x < dw; x++) {
-            const sx = Math.floor((x * sw) / dw);
-            const si = (sy * sw + sx) << 2;
-            const di = (y * dw + x) << 2;
-            dst[di] = src[si];
-            dst[di + 1] = src[si + 1];
-            dst[di + 2] = src[si + 2];
-            dst[di + 3] = 255;
-        }
-    }
-    const { data } = jpeg.encode({ data: dst, width: dw, height: dh }, quality);
-    return Buffer.from(data);
-}
-
-function getJpegDimensions(input: Buffer): { width: number; height: number } {
-    const { width, height } = jpeg.decode(input, { useTArray: true });
-    return { width, height };
-}
-
-function buildImageList(mode: string, full?: string, cropped?: string): string[] {
-    const list: string[] = [];
-    if (mode === 'both') {
-        if (full) list.push(full);
-        if (cropped) list.push(cropped);
-    } else if (mode === 'full') {
-        if (full) list.push(full);
-        else if (cropped) list.push(cropped);
-    } else { // 'cropped'
-        if (cropped) list.push(cropped);
-        else if (full) list.push(full);
-    }
-    return list;
-}
-
-/**
- * LLM Notifier Plugin for Scrypted
- * Enhances notifications with images using LLM analysis
- * Preserves known person names from notifications
- */
-
-function createMessageTemplate(userPrompt: string, imageUrls: string[], metadata: any) {
-    // Hardcoded base prompt with structural requirements
-    const basePrompt = `Analyze the security camera image and generate a notification.
-
-CRITICAL RULES (DO NOT VIOLATE):
-1. ONLY use names if metadata contains "Maybe: [name]" - use that EXACT name WITHOUT "Maybe:"
-2. If NO name in metadata, use generic terms: Person, Man, Woman, Visitor
-3. NEVER make up names like John, Sarah, etc. - only use names from metadata
-4. NEVER make up license plates like ABC123, XYZ789, etc. - only mention actual visible plates or "partially visible plate"
-5. NEVER include "Maybe:" in your response - only use the actual name
-6. Title format MUST be: "[Person/Object] at [location]"
-7. Some platforms only show title+body - put ALL critical info there
-8. Each field MUST contain different information - no repetition between fields
-9. Response MUST be valid JSON with exactly three fields: title, subtitle, body
-10. If using a person's name in title, use the same name in body - never switch to generic terms`;
-
-    const schema = "CRITICAL CHARACTER LIMITS - STRICTLY ENFORCE:\n- Title: MAXIMUM 32 characters (count every letter, space, punctuation)\n- Subtitle: MAXIMUM 32 characters (count every letter, space, punctuation)\n- Body: MAXIMUM 75 characters (count every letter, space, punctuation)\n\nYou MUST count characters before responding. Responses exceeding these limits will be REJECTED and cause system failure. If your description is too long, use shorter words and remove unnecessary details. The body character limit of 75 is ABSOLUTE and NON-NEGOTIABLE.";
-
-    return {
-        messages: [
-            {
-                role: "system",
-                content: basePrompt + '\n\n' + userPrompt + '\n\n' + schema,
-            },
-            {
-                role: "user",
-                content: [
-                    {
-                        type: 'text',
-                        text: `Original notification metadata: ${JSON.stringify(metadata, null, 2)}`,
-                    },
-                    ...imageUrls.map(url => ({
-                        type: 'image_url',
-                        image_url: { url }
-                    }))
-                ] as any
-            }
-        ],
-        response_format: {
-            type: "json_schema",
-            json_schema: {
-                name: "notification_response",
-                strict: true,
-                schema: {
-                    type: "object",
-                    properties: {
-                        title: {
-                            type: "string"
-                        },
-                        subtitle: {
-                            type: "string"
-                        },
-                        body: {
-                            type: "string"
-                        }
-                    },
-                    required: ["title", "subtitle", "body"],
-                    additionalProperties: false
-                }
-            }
-        }
-    };
-}
-
-class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
-    llmProvider!: LLMNotifierProvider;
-    private notificationStats = {
-        withSnapshot: 0,
-        withoutSnapshot: 0,
-        total: 0
-    };
-
-    async sendNotification(title: string, options?: NotifierOptions, media?: string | MediaObject, icon?: string | MediaObject) {
-        const timestamp = new Date().toISOString();
-        let imageSizeKB: number | undefined;
-        
-        // Update stats
-        this.notificationStats.total++;
-        
-        // Skip if no media or if disabled
-        if (!media || !this.llmProvider.storageSettings.values.enabled) {
-            this.notificationStats.withoutSnapshot++;
-            this.console.log(`[${timestamp}] 📊 Notification without snapshot - Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
-            return this.mixinDevice.sendNotification(title, options, media, icon);
-        }
-        
-        this.notificationStats.withSnapshot++;
-
-        let imageUrl: string | undefined;
-        let fullFrameUrl: string | undefined;
-        let imageUrls: string[] = [];
-        if (typeof media === 'string') {
-            imageUrl = media;
-        }
-        else {
-            const buffer = await mediaManager.convertMediaObjectToBuffer(media, 'image/jpeg');
-            const b64 = buffer.toString('base64');
-            imageUrl = `data:image/jpeg;base64,${b64}`;
-            imageSizeKB = Math.round(buffer.length / 1024);
-        }
-
-        // Optionally fetch a downscaled full-frame snapshot for THIS EVENT (no fresh camera snapshot)
-        try {
-            const snapshotMode = (this.llmProvider.storageSettings.values as any).snapshotMode || 'cropped';
-            if (snapshotMode !== 'cropped') {
-                const re = (options as any)?.recordedEvent;
-                const data = re?.data || {};
-                const detectionId = data?.detectionId || data?.detections?.[0]?.id;
-                const sourceId = data?.sourceId 
-                    || (options as any)?.data?.sourceId 
-                    || (typeof media !== 'string' ? (media as any)?.sourceId : undefined);
-                if (detectionId && sourceId) {
-                    const objDet = sdk.systemManager.getDeviceById(sourceId) as any;
-                    if (objDet?.getDetectionInput) {
-                        const fullMo = await objDet.getDetectionInput(detectionId, re?.eventId);
-                        try {
-                            const fullBuf = await mediaManager.convertMediaObjectToBuffer(fullMo, 'image/jpeg');
-                            const { width: sw, height: sh } = getJpegDimensions(fullBuf);
-                            // Automatic target width
-                            let targetWidth = sw;
-                            if (sw > 3000) targetWidth = 640;
-                            else if (sw > 1500) targetWidth = 512;
-                            else if (sw > 800) targetWidth = 384;
-                            const dw = Math.min(targetWidth, sw);
-                            const dh = Math.max(1, Math.round((sh * dw) / sw));
-                            const beforeKB = Math.round(fullBuf.length / 1024);
-                            const resized = await resizeJpegNearest(fullBuf, dw, 60);
-                            const b64 = resized.toString('base64');
-                            fullFrameUrl = `data:image/jpeg;base64,${b64}`;
-                            const afterKB = Math.round(resized.length / 1024);
-                            this.console.log(`[${timestamp}] 📐 Full frame resized ${sw}x${sh} ${beforeKB}KB -> ${dw}x${dh} ${afterKB}KB`);
-                        } catch (resizeErr) {
-                            this.console.warn('Full-frame local resize failed; using original full frame.', resizeErr);
-                            const buf = await mediaManager.convertMediaObjectToBuffer(fullMo, 'image/jpeg');
-                            const b64 = buf.toString('base64');
-                            fullFrameUrl = `data:image/jpeg;base64,${b64}`;
-                        }
-                    }
-                }
-            }
-        } catch (e) {
-            this.console.warn('Full-frame (event) retrieval/rescale failed:', e);
-        }
-
-        this.console.log('=== LLM Notifier Debug ===');
-        this.console.log('Original title:', title);
-        this.console.log('Original subtitle:', options?.subtitle);
-        this.console.log('Original body:', options?.body);
-        
-        // Build metadata for LLM
-        const metadata: any = {};
-        
-        // Include original message if enabled
-        if (this.llmProvider.storageSettings.values.includeOriginalMessage) {
-            metadata.originalTitle = title;
-            metadata.originalSubtitle = options?.subtitle;
-            metadata.originalBody = options?.body;
-            metadata.instruction = "Extract any 'Maybe: [name]' from the original text and use that name. Each field (title, subtitle, body) must contain DIFFERENT information - no repetition between fields.";
-        }
-
-        // Choose which image(s) to send
-        const snapshotMode = (this.llmProvider.storageSettings.values as any).snapshotMode || 'cropped';
-        imageUrls = buildImageList(snapshotMode, fullFrameUrl, imageUrl);
-
-        if (!imageUrls.length) {
-            this.console.warn('No usable snapshot. Forwarding original notification.');
-            return this.mixinDevice.sendNotification(title, options, media, icon);
-        }
-
-        const messageTemplate = createMessageTemplate(
-            this.llmProvider.storageSettings.values.userPrompt,
-            imageUrls,
-            metadata
-        );
-
-        // Track duplicate detections to analyze caching opportunities
-        const re = (options as any)?.recordedEvent;
-        const data = re?.data || {};
-        const detectionId = data?.detectionId || data?.detections?.[0]?.id;
-
-        if (detectionId) {
-            const key = `${detectionId}:${snapshotMode}`;
-            const text = `${title}|${options?.subtitle || ''}|${options?.body || ''}`;
-
-            const existing = this.llmProvider.detectionTracker.get(key);
-            if (existing) {
-                existing.count++;
-                if (existing.text !== text) {
-                    this.console.warn(`⚠️  Detection key reused with DIFFERENT text:\n  Key: ${key}\n  Previous: "${existing.text}"\n  Current:  "${text}"`);
-                } else {
-                    this.console.log(`✓ Duplicate detection #${existing.count} (identical text): ${key}`);
-                }
-            } else {
-                this.llmProvider.detectionTracker.set(key, {text, count: 1});
-                this.console.log(`🔍 New detection: ${key}`);
-            }
-        }
-
-        // Check response cache before calling LLM
-        let newTitle: string;
-        let subtitle: string;
-        let body: string;
-
-        try {
-            if (detectionId) {
-            const cacheKey = `${detectionId}:${snapshotMode}`;
-            const cached = this.llmProvider.responseCache.get(cacheKey);
-
-            if (cached) {
-                this.console.log(`💾 Cache HIT: ${cacheKey}`);
-                newTitle = cached.title;
-                subtitle = cached.subtitle;
-                body = cached.body;
-            } else {
-                // Check if another request is already in-flight for this key
-                const inFlight = this.llmProvider.inFlightRequests.get(cacheKey);
-
-                if (inFlight) {
-                    this.console.log(`⏳ Waiting for in-flight request: ${cacheKey}`);
-                    const result = await inFlight;
-                    newTitle = result.title;
-                    subtitle = result.subtitle;
-                    body = result.body;
-                } else {
-                    this.console.log(`❌ Cache MISS: ${cacheKey}`);
-
-                    // Create and store the promise before starting the LLM call
-                    const llmPromise = (async () => {
-                        const start = Date.now();
-                        const device = this.llmProvider.selectProvider();
-                        const timeoutSec = (this.llmProvider.storageSettings.values as any).llmTimeoutMs ?? 90;
-                        const llmTimeout = Math.max(1, Number(timeoutSec)) * 1000;
-                        this.console.log(`Calling LLM (timeout ${llmTimeout}ms)...`);
-
-                        try {
-                            const llmData = await withTimeout(device.getChatCompletion(messageTemplate as any), llmTimeout, 'LLM request');
-                            const responseTime = Date.now() - start;
-                            const responseTimeSeconds = Math.round(responseTime / 1000);
-
-                            const content = llmData.choices[0].message.content;
-                            if (!content) {
-                                throw new Error('Empty response from LLM');
-                            }
-                            const json = JSON.parse(content);
-                            this.console.log('LLM response:', json);
-
-                            const result = {
-                                title: json.title,
-                                subtitle: json.subtitle,
-                                body: json.body
-                            };
-
-                            if (typeof result.title !== 'string' || typeof result.subtitle !== 'string' || typeof result.body !== 'string') {
-                                throw new Error('Invalid response format from LLM');
-                            }
-
-                            // Store in cache
-                            this.llmProvider.responseCache.set(cacheKey, result);
-
-                            // Log all stats together
-                            this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Inference: ${responseTimeSeconds}s, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
-
-                            return result;
-                        } finally {
-                            // Clean up in-flight map
-                            this.llmProvider.inFlightRequests.delete(cacheKey);
-                        }
-                    })();
-
-                    // Store the promise immediately so other concurrent requests can await it
-                    this.llmProvider.inFlightRequests.set(cacheKey, llmPromise);
-
-                    // Await the result
-                    const result = await llmPromise;
-                    newTitle = result.title;
-                    subtitle = result.subtitle;
-                    body = result.body;
-                }
-            }
-        } else {
-            // No detectionId, must call LLM
-            this.console.log(`⚠️  No detectionId, skipping cache`);
-            const start = Date.now();
-            const device = this.llmProvider.selectProvider();
-            const timeoutSec = (this.llmProvider.storageSettings.values as any).llmTimeoutMs ?? 90;
-            const llmTimeout = Math.max(1, Number(timeoutSec)) * 1000;
-            this.console.log(`Calling LLM (timeout ${llmTimeout}ms)...`);
-
-            try {
-                const llmData = await withTimeout(device.getChatCompletion(messageTemplate as any), llmTimeout, 'LLM request');
-                const responseTime = Date.now() - start;
-                const responseTimeSeconds = Math.round(responseTime / 1000);
-
-                const content = llmData.choices[0].message.content;
-                if (!content) {
-                    throw new Error('Empty response from LLM');
-                }
-                const json = JSON.parse(content);
-                this.console.log('LLM response:', json);
-
-                newTitle = json.title;
-                subtitle = json.subtitle;
-                body = json.body;
-
-                if (typeof newTitle !== 'string' || typeof subtitle !== 'string' || typeof body !== 'string') {
-                    throw new Error('Invalid response format from LLM');
-                }
-
-                // Log all stats together
-                this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Inference: ${responseTimeSeconds}s, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
-            } catch (e) {
-                throw e; // Re-throw to outer catch block
-            }
-            }
-
-            // Update options with LLM-generated content
-            options ||= {};
-            options.body = body;
-            options.subtitle = subtitle;  // For iOS and Scrypted UI (not shown on Android HA)
-            options.bodyWithSubtitle = body;  // Required for iOS to display body when subtitle is present
-
-            return await this.mixinDevice.sendNotification(newTitle, options, media, icon);
-        } catch (e) {
-            this.console.warn('LLM enhancement failed, using original notification:', e);
-            return await this.mixinDevice.sendNotification(title, options, media, icon);
-        }
-    }
-}
-
-export default class LLMNotifierProvider extends ScryptedDeviceBase implements MixinProvider, Settings {
+export default class LLMNotifierProvider extends ScryptedDeviceBase implements MixinProvider, Settings, HttpRequestHandler {
     private currentProviderIndex = 0;
+    private summaryScheduleTimeout: NodeJS.Timeout | undefined;
+    private dailyBriefStartupTimer: NodeJS.Timeout | undefined;
+    private dailyBriefIntervalTimer: NodeJS.Timeout | undefined;
+    private pruneIntervalTimer: NodeJS.Timeout | undefined;
     detectionTracker = new LRUCache<string, {text: string, count: number}>({
         max: 100,
         ttl: 1000 * 60 * 30, // 30 minutes - longer TTL to see more detections
     });
-    responseCache = new LRUCache<string, {title: string, subtitle: string, body: string}>({
+    responseCache = new LRUCache<string, {title: string, subtitle: string, body: string, detailedDescription: string, clarity?: {score: number, reason: string}}>({
         max: 1000,
         ttl: 1000 * 60 * 5, // 5 minutes
     });
-    inFlightRequests = new Map<string, Promise<{title: string, subtitle: string, body: string}>>();
+    inFlightRequests = new Map<string, Promise<{title: string, subtitle: string, body: string, detailedDescription: string, clarity?: {score: number, reason: string}}>>();
+    posterStore: PosterStore;
+    notificationStore: NotificationStore;
+    private pluginVersion: string;
+
+    constructor(nativeId?: string) {
+        super(nativeId);
+        this.notificationStore = new NotificationStore(this.storage);
+        this.posterStore = new PosterStore(() => mediaManager.getFilesPath());
+        try {
+            this.pluginVersion = require('../package.json').version;
+        } catch {
+            this.pluginVersion = 'unknown';
+        }
+
+        // Wire configurable retention (storageSettings not available in constructor)
+        const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
+        this.notificationStore.setRetentionDays(isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw);
+
+        // Prune orphaned poster files (fire-and-forget)
+        const validIds = this.notificationStore.getAllIds();
+        this.posterStore.prune(validIds).then(n => {
+            if (n > 0) this.console.log(`[Poster] Pruned ${n} orphaned posters`);
+        }).catch(e => this.console.warn('[Poster] Prune failed:', e));
+
+        // Log endpoint URL on startup
+        this.logEndpoint();
+
+        // Schedule daily brief notification
+        this.scheduleDailySummary();
+
+        // Start background generation timer
+        this.startDailyBriefTimer();
+
+        // Start periodic poster prune timer
+        this.startPruneTimer();
+    }
+
+    private async logEndpoint() {
+        try {
+            const endpoint = await endpointManager.getLocalEndpoint(this.nativeId, { public: true });
+            this.console.log(`Daily Brief available at: ${endpoint.replace(/\/+$/, '')}/brief`);
+        } catch (e) {
+            // Ignore - endpoint may not be ready yet
+        }
+    }
+
+    // Calculate milliseconds until target hour in user's timezone
+    private msUntilLocalTime(hour: number, timezone: string): number {
+        const now = new Date();
+        const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone,
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false
+        });
+        const parts = formatter.formatToParts(now);
+        const localHour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+        const localMinute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+
+        let hoursUntil = hour - localHour;
+        if (hoursUntil < 0 || (hoursUntil === 0 && localMinute > 0)) {
+            hoursUntil += 24; // Schedule for next day
+        }
+        return (hoursUntil * 60 - localMinute) * 60 * 1000;
+    }
+
+    // Schedule daily summary generation and notification
+    private scheduleDailySummary() {
+        // Clear any existing timeout
+        if (this.summaryScheduleTimeout) {
+            clearTimeout(this.summaryScheduleTimeout);
+            this.summaryScheduleTimeout = undefined;
+        }
+
+        // Check if feature is enabled
+        if (!(this.storageSettings.values as any).dailyBriefEnabled) {
+            return;
+        }
+
+        const timezone = this.storage.getItem('dailyBriefTimezone') || 'America/Los_Angeles';
+        const hour = (this.storageSettings.values as any).dailyBriefHour ?? 20;
+        const ms = this.msUntilLocalTime(hour, timezone);
+        const hoursUntil = Math.round(ms / 3600000 * 10) / 10;
+
+        this.console.log(`Daily Brief scheduled in ${hoursUntil}h (${timezone}, ${hour}:00)`);
+
+        this.summaryScheduleTimeout = setTimeout(async () => {
+            await this.generateAndNotifySummary();
+            this.scheduleDailySummary(); // Reschedule for next day
+        }, ms);
+    }
+
+    // Clear all Daily Brief timers
+    private clearDailyBriefTimers() {
+        if (this.dailyBriefStartupTimer) {
+            clearTimeout(this.dailyBriefStartupTimer);
+            this.dailyBriefStartupTimer = undefined;
+        }
+        if (this.dailyBriefIntervalTimer) {
+            clearInterval(this.dailyBriefIntervalTimer);
+            this.dailyBriefIntervalTimer = undefined;
+        }
+    }
+
+    // Start background generation timer for Daily Brief (aligned to top of hour)
+    private startDailyBriefTimer() {
+        // Clear any existing timers
+        this.clearDailyBriefTimers();
+
+        let intervalMinutes = parseInt(this.storage.getItem('dailyBriefGenerationInterval') || '60', 10);
+        if (intervalMinutes <= 0) {
+            this.console.log('[Daily Brief] Background generation disabled');
+            return;
+        }
+        // Minimum 5 minutes to prevent excessive LLM calls
+        if (intervalMinutes > 0 && intervalMinutes < 5) {
+            this.console.warn(`[Daily Brief] Interval ${intervalMinutes}m too short, using 5m minimum`);
+            intervalMinutes = 5;
+        }
+
+        const intervalMs = intervalMinutes * 60 * 1000;
+
+        // Calculate ms until next top of hour
+        const now = new Date();
+        const msUntilNextHour = (60 - now.getMinutes()) * 60 * 1000 - now.getSeconds() * 1000 - now.getMilliseconds();
+
+        // If we just passed the top of the hour (within 5 seconds), run immediately
+        // instead of waiting ~60 minutes. msUntilNextHour will be close to 60 min in this case.
+        const effectiveDelay = msUntilNextHour > (60 * 60 * 1000 - 5000) ? 0 : msUntilNextHour;
+
+        this.console.log(`[Daily Brief] Timer starts at top of hour (in ${Math.round(effectiveDelay / 1000 / 60)} min), then every ${intervalMinutes} min`);
+
+        // Generate immediately if no cached summary exists
+        const timezone = this.storage.getItem('dailyBriefTimezone') || 'America/Los_Angeles';
+        const cached = this.notificationStore.getCachedSummary(new Date(), timezone);
+        if (!cached) {
+            this.console.log('[Daily Brief] No cached summary found, generating now...');
+            this.generateDailyBriefInBackground();
+        }
+
+        // First run at top of hour, then interval
+        this.dailyBriefStartupTimer = setTimeout(() => {
+            this.dailyBriefStartupTimer = undefined;
+            this.generateDailyBriefInBackground();
+            this.dailyBriefIntervalTimer = setInterval(() => {
+                this.generateDailyBriefInBackground();
+            }, intervalMs);
+        }, effectiveDelay);
+    }
+
+    private startPruneTimer() {
+        if (this.pruneIntervalTimer) {
+            clearInterval(this.pruneIntervalTimer);
+            this.pruneIntervalTimer = undefined;
+        }
+
+        const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
+        const retentionDays = isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw;
+        const intervalMs = (retentionDays + 2) * 24 * 60 * 60 * 1000;
+
+        this.pruneIntervalTimer = setInterval(() => {
+            const validIds = this.notificationStore.getAllIds();
+            this.posterStore.prune(validIds).then(n => {
+                if (n > 0) this.console.log(`[Poster] Periodic prune: removed ${n} orphaned posters`);
+            }).catch(e => this.console.warn('[Poster] Periodic prune failed:', e));
+        }, intervalMs);
+
+        this.console.log(`[Poster] Prune timer set: every ${retentionDays + 2} days`);
+    }
+
+    // Generate Daily Brief summary in background (no notification)
+    private async generateDailyBriefInBackground(forceFullRegeneration: boolean = false) {
+        try {
+            const timezone = this.storage.getItem('dailyBriefTimezone') || 'America/Los_Angeles';
+            const now = new Date();
+            const windowEnd = now.getTime();
+
+            // Calculate midnight yesterday in the user's timezone
+            const formatter = new Intl.DateTimeFormat('en-US', {
+                timeZone: timezone,
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false
+            });
+            const parts = formatter.formatToParts(now);
+            const getPart = (type: string) => parseInt(parts.find(p => p.type === type)?.value || '0');
+            const tzHour = getPart('hour');
+            const tzMinute = getPart('minute');
+            const tzSecond = getPart('second');
+
+            const msSinceMidnight = ((tzHour * 60 + tzMinute) * 60 + tzSecond) * 1000;
+            const midnightTodayUtc = windowEnd - msSinceMidnight;
+            const windowStart = midnightTodayUtc - (24 * 60 * 60 * 1000); // Midnight yesterday
+
+            this.console.log(`[Daily Brief] Window: ${new Date(windowStart).toISOString()} to ${new Date(windowEnd).toISOString()} (${timezone})`);
+
+            const notifications = this.notificationStore.getForTimeRange(windowStart, windowEnd);
+
+            if (notifications.length === 0) {
+                this.console.log('[Daily Brief] No notifications in window, skipping background generation');
+                return;
+            }
+
+            const dateStr = now.toLocaleDateString('en-US', {
+                weekday: 'long',
+                month: 'long',
+                day: 'numeric',
+                year: 'numeric',
+                timeZone: timezone
+            });
+
+            // === Incremental Narrative Generation ===
+
+            // 1. Calculate natural 6-hour periods spanning the window
+            const naturalPeriods = getNaturalPeriods(windowStart, windowEnd, timezone);
+
+            // 2. Load existing frozen segments (skip if force refresh)
+            let existingFrozen: FrozenSegment[] = [];
+            if (!forceFullRegeneration) {
+                const cached = this.notificationStore.getCachedSummary(now, timezone);
+                if (cached?.frozenSegments) {
+                    // Only keep frozen segments whose periods are still within the window
+                    existingFrozen = cached.frozenSegments.filter(
+                        fs => fs.periodEnd > windowStart && fs.periodStart < windowEnd
+                    );
+                }
+            }
+
+            // 3. Identify completed periods (end time strictly before now) already frozen → keep them
+            // Use strict < to avoid premature freezing at exact period boundaries
+            const frozenKeys = new Set(existingFrozen.map(fs => fs.periodKey));
+            const completedPeriods = naturalPeriods.filter(p => p.end < windowEnd);
+            const activePeriods = naturalPeriods.filter(p => p.end >= windowEnd);
+
+            // Periods to generate: active + completed-but-not-yet-frozen
+            const periodsToGenerate = [
+                ...completedPeriods.filter(p => !frozenKeys.has(p.key)),
+                ...activePeriods
+            ];
+
+            if (periodsToGenerate.length === 0 && existingFrozen.length > 0) {
+                this.console.log(`[Daily Brief] All periods frozen, updating cache timestamp (${existingFrozen.length} frozen segments)`);
+                const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
+                const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(fs => fs.narrative);
+                frozenHighlights.forEach((h, i) => { h.index = i; });
+                const overview = frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
+                this.notificationStore.setCachedSummary(
+                    now, overview, notifications.length, frozenHighlights,
+                    windowStart, windowEnd, timezone, overview, frozenNarrative, existingFrozen
+                );
+                return;
+            }
+
+            this.console.log(`[Daily Brief] Incremental: ${existingFrozen.length} frozen, ${periodsToGenerate.length} to generate (force=${forceFullRegeneration})`);
+
+            // 4. Filter notifications to only those in periods to generate
+            const periodsToGenerateNotifications = notifications.filter(n => {
+                return periodsToGenerate.some(p => n.timestamp >= p.start && n.timestamp < p.end);
+            });
+
+            if (periodsToGenerateNotifications.length === 0 && existingFrozen.length > 0) {
+                this.console.log(`[Daily Brief] No new notifications in active periods, keeping frozen segments`);
+                // Re-store with existing data (updates generatedAt)
+                const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
+                const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(fs => fs.narrative);
+                // Re-index highlights contiguously
+                frozenHighlights.forEach((h, i) => { h.index = i; });
+                const overview = frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
+                this.notificationStore.setCachedSummary(
+                    now, overview, notifications.length, frozenHighlights,
+                    windowStart, windowEnd, timezone, overview, frozenNarrative, existingFrozen
+                );
+                return;
+            }
+
+            // 5. Bucket + select candidates for only the periods to generate
+            const buckets = createTimeBuckets(periodsToGenerateNotifications, windowStart, windowEnd, 12, timezone);
+            const candidates = selectCandidatesFromBuckets(buckets, 8);
+
+            const bucketSummary = buckets.map(b => `${b.label}: ${b.notifications.length}`).join(', ');
+            this.console.log(`[Daily Brief] Buckets: ${bucketSummary}`);
+            this.console.log(`[Daily Brief] Selected ${candidates.length} candidates from ${periodsToGenerateNotifications.length} events (${notifications.length} total)`);
+
+            // Guard: if no candidates were selected, skip LLM call
+            if (candidates.length === 0) {
+                this.console.log(`[Daily Brief] No candidates after bucketing, skipping LLM call`);
+                if (existingFrozen.length > 0) {
+                    // Re-store frozen segments only (updates generatedAt)
+                    const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
+                    const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(fs => fs.narrative);
+                    frozenHighlights.forEach((h, i) => { h.index = i; });
+                    const fallbackOverview = frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
+                    this.notificationStore.setCachedSummary(
+                        now, fallbackOverview, notifications.length, frozenHighlights,
+                        windowStart, windowEnd, timezone, fallbackOverview, frozenNarrative, existingFrozen
+                    );
+                }
+                return;
+            }
+
+            // 6. Build frozen context for the LLM prompt
+            const frozenContext = existingFrozen.length > 0 ? buildFrozenContext(existingFrozen) : undefined;
+            if (frozenContext) {
+                this.console.log(`[Daily Brief] Providing ${existingFrozen.length} frozen segments as context to LLM`);
+            }
+
+            // 7. Read custom instructions from settings
+            const customInstructions = this.storage.getItem('dailyBriefCustomPrompt') || '';
+
+            // 8. Generate summary for new candidates (with frozen context)
+            const { summary, overview, narrative, highlightIds } = await this.generateDailySummary(
+                candidates, dateStr, timezone, customInstructions || undefined, frozenContext
+            );
+
+            // 9. Build highlights for the new segments
+            const newHighlights = buildCachedHighlights(candidates, highlightIds, timezone);
+
+            // 10. Freeze any newly-completed segments
+            const newFrozen: FrozenSegment[] = [...existingFrozen];
+            if (narrative) {
+                for (const segment of narrative) {
+                    const matchedPeriod = matchSegmentToPeriod(segment, completedPeriods, candidates);
+                    if (matchedPeriod && !frozenKeys.has(matchedPeriod.key)) {
+                        // Resolve this segment's highlights to notification IDs (stable across runs)
+                        const segmentNotifIds = (segment.highlightIds || [])
+                            .filter(idx => idx >= 0 && idx < candidates.length)
+                            .map(idx => candidates[idx].notification.id);
+                        const segmentHighlights = buildCachedHighlights(candidates, segmentNotifIds, timezone);
+
+                        newFrozen.push({
+                            periodKey: matchedPeriod.key,
+                            periodStart: matchedPeriod.start,
+                            periodEnd: matchedPeriod.end,
+                            narrative: segment,
+                            highlights: segmentHighlights,
+                            highlightNotificationIds: segmentNotifIds,
+                        });
+                        frozenKeys.add(matchedPeriod.key);
+                    }
+                }
+            }
+
+            // 10b. Freeze empty completed periods (no events = no segments matched)
+            for (const period of completedPeriods) {
+                if (!frozenKeys.has(period.key)) {
+                    newFrozen.push({
+                        periodKey: period.key,
+                        periodStart: period.start,
+                        periodEnd: period.end,
+                        narrative: { timeRange: period.label, text: '', highlightIds: [] },
+                        highlights: [],
+                        highlightNotificationIds: [],
+                    });
+                    frozenKeys.add(period.key);
+                }
+            }
+
+            // 11. Merge: frozen segments + active (non-frozen) segments
+            // Clone frozen narratives to avoid mutating originals during re-indexing
+            this.console.log(`[Daily Brief] Reusing frozen periods: ${existingFrozen.map(fs => fs.periodKey).join(', ') || 'none'}`);
+            const narrativeToFrozen = new Map<NarrativeSegment, FrozenSegment>();
+            const frozenNarrative: NarrativeSegment[] = [];
+            for (const fs of existingFrozen) {
+                if (!fs.narrative.text) continue;  // Skip empty frozen periods (no events)
+                const cloned: NarrativeSegment = {
+                    timeRange: fs.narrative.timeRange,
+                    text: fs.narrative.text,
+                    highlightIds: [...fs.narrative.highlightIds],
+                };
+                frozenNarrative.push(cloned);
+                narrativeToFrozen.set(cloned, fs);
+            }
+            const activeNarrative = narrative?.filter(seg => {
+                const matched = matchSegmentToPeriod(seg, completedPeriods, candidates);
+                // Keep segments that are NOT in a newly-frozen completed period
+                // (they're already in frozenNarrative from existingFrozen) OR are active
+                return !matched || !existingFrozen.some(fs => fs.periodKey === matched.key);
+            }) || [];
+            const mergedNarrative = [...frozenNarrative, ...activeNarrative];
+
+            if (activeNarrative.length === 0 && narrative && narrative.length > 0) {
+                this.console.log(`[Daily Brief] All ${narrative.length} new segments matched frozen periods, no active segments added`);
+            }
+
+            // Merge highlights: frozen + new, re-index contiguously
+            const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
+            const mergedHighlights = [...frozenHighlights, ...newHighlights];
+            mergedHighlights.forEach((h, i) => { h.index = i; });
+
+            // Re-index highlight IDs in merged narrative segments to match new contiguous indices
+            const highlightIdMap = new Map(mergedHighlights.map((h, i) => [h.id, i]));
+            for (const seg of mergedNarrative) {
+                const frozenSeg = narrativeToFrozen.get(seg);
+                if (frozenSeg) {
+                    // Frozen segments: use stored notification IDs (stable across runs)
+                    seg.highlightIds = frozenSeg.highlightNotificationIds
+                        .map(notifId => highlightIdMap.get(notifId) ?? -1)
+                        .filter(idx => idx >= 0);
+                } else {
+                    // New segments: highlightIds are candidate array indices
+                    seg.highlightIds = seg.highlightIds
+                        .map(oldIdx => {
+                            if (oldIdx >= 0 && oldIdx < candidates.length) {
+                                const notifId = candidates[oldIdx]?.notification?.id;
+                                if (!notifId) return -1;
+                                return highlightIdMap.get(notifId) ?? -1;
+                            }
+                            return -1;
+                        })
+                        .filter(idx => idx >= 0);
+                }
+            }
+
+            // Sort merged narrative chronologically by period start time
+            mergedNarrative.sort((a, b) => {
+                const aFrozen = narrativeToFrozen.get(a);
+                const bFrozen = narrativeToFrozen.get(b);
+                const aTime = aFrozen ? aFrozen.periodStart : (a.highlightIds.length > 0 && a.highlightIds[0] < mergedHighlights.length ? mergedHighlights[a.highlightIds[0]]?.timestamp || 0 : 0);
+                const bTime = bFrozen ? bFrozen.periodStart : (b.highlightIds.length > 0 && b.highlightIds[0] < mergedHighlights.length ? mergedHighlights[b.highlightIds[0]]?.timestamp || 0 : 0);
+                return aTime - bTime;
+            });
+
+            // 12. Build final summary
+            const mergedOverview = overview || summary;
+
+            this.notificationStore.setCachedSummary(
+                now, mergedOverview, notifications.length, mergedHighlights,
+                windowStart, windowEnd, timezone, mergedOverview, mergedNarrative, newFrozen
+            );
+            this.console.log(`[Daily Brief] Background generation complete (${mergedHighlights.length} highlights, ${mergedNarrative.length} segments, ${newFrozen.length} frozen)`);
+        } catch (e) {
+            this.console.error('[Daily Brief] Background generation failed:', e);
+        }
+    }
+
+    // Generate summary and send notification (scheduled Daily Brief)
+    private async generateAndNotifySummary() {
+        this.console.log('[Daily Brief] Scheduled notification triggered');
+        const today = new Date();
+        const timezone = this.storage.getItem('dailyBriefTimezone') || 'America/Los_Angeles';
+
+        try {
+            // Use centralized generation logic
+            await this.generateDailyBriefInBackground();
+
+            // Get the generated summary from cache
+            const cached = this.notificationStore.getCachedSummary(today, timezone);
+            if (!cached) {
+                this.console.log('No summary generated, skipping notification');
+                return;
+            }
+
+            // Send notification
+            this.console.log('[Daily Brief] Summary generated, sending notification...');
+            await this.sendDailyBriefNotification(today, cached.summary, cached.notificationCount);
+            this.console.log('[Daily Brief] Summary generated and notification sent');
+        } catch (e) {
+            this.console.error('Failed to generate scheduled summary:', e);
+        }
+    }
+
+    // Send notification with link to Daily Brief
+    private async sendDailyBriefNotification(date: Date, summary: string, eventCount: number) {
+        try {
+            // storageSettings.values for type:'device' (non-multiple) returns the device object directly
+            const notifier = (this.storageSettings.values as any).dailyBriefNotifier as (Notifier & ScryptedDevice) | undefined;
+            if (!notifier) {
+                this.console.warn('[Daily Brief] No notifier selected for Daily Brief notifications');
+                return;
+            }
+
+            const briefUrl = (this.storageSettings.values as any).dailyBriefNotificationUrl || '/daily-brief/0';
+
+            await notifier.sendNotification(
+                'Daily Brief Ready',
+                {
+                    subtitle: `${eventCount} events today`,
+                    body: summary.substring(0, 75),
+                    data: { ha: { url: briefUrl, clickAction: briefUrl } }
+                }
+            );
+
+            this.console.log(`Daily Brief notification sent to ${notifier.name}`);
+        } catch (e) {
+            this.console.error('Failed to send Daily Brief notification:', e);
+        }
+    }
+
+    async generateDailySummary(candidates: CandidateWithPriority[], dateStr: string, timezone: string, customInstructions?: string, frozenContext?: string): Promise<{ summary: string; overview?: string; narrative?: NarrativeSegment[]; highlightIds: string[] }> {
+        this.console.log(`[Daily Brief] Starting summary generation for ${candidates.length} candidates`);
+
+        const device = this.selectProvider();
+        if (!device) {
+            this.console.error(`[Daily Brief] No LLM provider available`);
+            throw new Error('No LLM provider available');
+        }
+
+        // Safety cap only - modern LLMs handle large context well
+        const MAX_CANDIDATES = 10000;
+        const limitedCandidates = candidates.length > MAX_CANDIDATES
+            ? candidates.slice(0, MAX_CANDIDATES)
+            : candidates;
+        if (candidates.length > MAX_CANDIDATES) {
+            this.console.log(`[Daily Brief] Limiting to ${MAX_CANDIDATES} of ${candidates.length} candidates`);
+        }
+
+        const prompt = createSummaryPrompt(limitedCandidates, dateStr, timezone, customInstructions, frozenContext);
+        const promptSize = JSON.stringify(prompt).length;
+        const timeoutMs = Math.max(1, Number((this.storageSettings.values as any).llmTimeoutMs ?? 90)) * 1000;
+
+        this.console.log(`[Daily Brief] Sending ${limitedCandidates.length} candidates to LLM (prompt: ${promptSize} chars, timeout: ${timeoutMs}ms)`);
+
+        const llmStartTime = Date.now();
+        try {
+            const result = await withTimeout(
+                device.getChatCompletion({
+                    ...prompt,
+                    temperature: 0.1,
+                    max_tokens: 2000  // Increased for narrative response
+                } as any),
+                timeoutMs,
+                'Daily summary generation'
+            );
+
+            const llmElapsed = Date.now() - llmStartTime;
+            this.console.log(`[Daily Brief] LLM completed in ${llmElapsed}ms`);
+
+            const content = result.choices[0]?.message?.content;
+            this.console.log(`[Daily Brief] Response length: ${content?.length || 0} chars`);
+
+            if (!content) {
+                throw new Error('Empty response from LLM');
+            }
+
+            // Parse JSON response (strip markdown code blocks if present)
+            try {
+                let jsonContent = content.trim();
+                // Remove markdown code block wrapper if present
+                if (jsonContent.startsWith('```')) {
+                    jsonContent = jsonContent.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
+                }
+                const json = JSON.parse(jsonContent);
+
+                // Handle new narrative format with explicit validation (#7)
+                if (!json.overview || typeof json.overview !== 'string') {
+                    this.console.warn('[Daily Brief] Missing or invalid overview in LLM response');
+                }
+                if (!Array.isArray(json.narrative)) {
+                    this.console.warn('[Daily Brief] Missing or invalid narrative array in LLM response');
+                }
+
+                const overview = (typeof json.overview === 'string') ? json.overview : '';
+
+                // Validate and filter narrative segments (#4)
+                const rawSegments = Array.isArray(json.narrative) ? json.narrative : [];
+                const narrativeSegments: NarrativeSegment[] = [];
+                for (const segment of rawSegments) {
+                    if (typeof segment.timeRange !== 'string' ||
+                        typeof segment.text !== 'string' ||
+                        !Array.isArray(segment.highlightIds)) {
+                        this.console.warn(`[Daily Brief] Invalid segment structure, skipping:`, JSON.stringify(segment));
+                        continue;
+                    }
+                    // Skip empty segments (#8 - prompt says min 1 highlightId)
+                    if (segment.highlightIds.length === 0) {
+                        this.console.warn(`[Daily Brief] Empty highlightIds in segment "${segment.timeRange}", skipping`);
+                        continue;
+                    }
+                    narrativeSegments.push(segment);
+                }
+
+                // Collect all highlight indices from narrative segments
+                const allHighlightIndices = new Set<number>();
+                for (const segment of narrativeSegments) {
+                    const invalidIndices: (number | string)[] = [];
+                    for (const idx of segment.highlightIds || []) {
+                        // Validate element type (#8)
+                        if (typeof idx !== 'number') {
+                            invalidIndices.push(idx);
+                            continue;
+                        }
+                        // Validate bounds (#5)
+                        if (idx >= 0 && idx < limitedCandidates.length) {
+                            allHighlightIndices.add(idx);
+                        } else {
+                            invalidIndices.push(idx);
+                        }
+                    }
+                    if (invalidIndices.length > 0) {
+                        this.console.warn(`[Daily Brief] Invalid indices in segment "${segment.timeRange}": ${invalidIndices.join(', ')}`);
+                    }
+                }
+
+                // Enforce vehicle cap: max 3 vehicles unless delivery-related (#1)
+                const MAX_VEHICLES = 3;
+                const vehicleIndices: number[] = [];
+                for (const idx of allHighlightIndices) {
+                    if (isVehicleNotification(limitedCandidates[idx].notification)) {
+                        vehicleIndices.push(idx);
+                    }
+                }
+                if (vehicleIndices.length > MAX_VEHICLES) {
+                    // Remove excess vehicles (keep first 3 chronologically)
+                    vehicleIndices.sort((a, b) => a - b);
+                    for (const idx of vehicleIndices.slice(MAX_VEHICLES)) {
+                        allHighlightIndices.delete(idx);
+                    }
+                    this.console.warn(`[Daily Brief] Vehicle cap: removed ${vehicleIndices.length - MAX_VEHICLES} excess vehicles (max ${MAX_VEHICLES})`);
+                }
+
+                // Convert indices to notification IDs
+                const highlightIds = Array.from(allHighlightIndices)
+                    .sort((a, b) => a - b)
+                    .map(idx => limitedCandidates[idx].notification.id);
+
+                // Create summary from overview with fallback (#3, #9)
+                let summary = overview;
+                if (!summary && narrativeSegments.length > 0) {
+                    // Include time context when falling back to narrative text
+                    summary = narrativeSegments.map(s => `${s.timeRange}: ${s.text}`).join(' ');
+                }
+                if (!summary) {
+                    summary = 'No summary available';
+                }
+
+                this.console.log(`[Daily Brief] Narrative generated: ${narrativeSegments.length} segments, ${highlightIds.length} unique highlights`);
+                for (const segment of narrativeSegments) {
+                    this.console.log(`  - ${segment.timeRange}: ${segment.highlightIds?.length || 0} events`);
+                }
+
+                return { summary: summary.trim(), overview, narrative: narrativeSegments, highlightIds };
+            } catch (parseErr) {
+                // Fallback: treat entire response as summary with no highlights
+                this.console.warn(`[Daily Brief] JSON parse failed, using plain text:`, parseErr);
+                return { summary: content.trim(), highlightIds: [] };
+            }
+        } catch (e) {
+            this.console.error(`[Daily Brief] LLM call failed:`, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Unified helper to fetch and format Daily Brief data for endpoints.
+     * Consolidates duplicate logic between /brief/ha-card and /brief endpoints.
+     */
+    private async getDailyBriefData(
+        targetDate: Date,
+        timezone: string,
+        mode: 'normal' | 'incremental' | 'full',
+        notifications: StoredNotification[],
+        baseUrl?: string
+    ): Promise<DailyBriefData> {
+        // Fetch cached summary
+        let cached = this.notificationStore.getCachedSummary(targetDate, timezone);
+
+        // Incremental or full regeneration when requested
+        if (mode !== 'normal' && notifications.length > 0) {
+            const forceFullRegeneration = mode === 'full';
+            this.console.log(`[Daily Brief] ${mode} regeneration`);
+            await this.generateDailyBriefInBackground(forceFullRegeneration);
+            cached = this.notificationStore.getCachedSummary(targetDate, timezone);
+        }
+
+        // Format generation timestamp
+        const generatedAt = cached?.generatedAt || null;
+        const dateFormatted = generatedAt
+            ? `Generated ${new Date(generatedAt).toLocaleString('en-US', {
+                weekday: 'long',
+                month: 'long',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true,
+                timeZone: timezone
+            })}`
+            : 'No Daily Brief generated yet';
+
+        // Format date in user's timezone (YYYY-MM-DD)
+        const localDateStr = targetDate.toLocaleDateString('en-CA', { timeZone: timezone });
+
+        // Build highlights with optional video clip and poster-quality snapshot URLs
+        const highlights = (cached?.highlights || []).map(h => ({
+            ...h,
+            ...(baseUrl ? {
+                clip: `${baseUrl}/brief/video?id=${encodeURIComponent(h.id)}`,
+                thumbnail: h.thumbnail ? `${baseUrl}/brief/snapshot?id=${encodeURIComponent(h.id)}` : '',
+            } : {})
+        }));
+
+        return {
+            date: localDateStr,
+            dateFormatted,
+            summary: cached?.summary || 'No Daily Brief generated yet.',
+            overview: cached?.overview,
+            narrative: cached?.narrative,
+            highlights,
+            eventCount: notifications.length,
+            hasDailyBrief: !!cached?.summary,
+            generatedAt
+        };
+    }
+
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        const url = request.url || '';
+        const path = url.replace(request.rootPath || '', '').split('?')[0];
+
+        this.console.log(`[Daily Brief] Request: ${path}`);
+
+        try {
+        // HA card loader pattern: tiny loader at the registered URL dynamically
+        // imports the real bundle with a version query param for cache busting.
+        // Users register this URL once and never need to change it.
+        if (path === '/assets/daily-brief-card.js') {
+            const loader = `(async()=>{let b='';try{const m=import.meta.url.match(/(.*?)\\/assets\\/daily-brief-card\\.js(?:\\?|$)/);if(m)b=m[1];}catch(e){}if(!b){console.error('[daily-brief-card] Could not determine base URL. import.meta.url:',String(import.meta&&import.meta.url));return;}try{const r=await fetch(b+'/assets/card-version');const{version:v}=await r.json();await import(b+'/assets/daily-brief-card-bundle.js?v='+v);}catch(e){console.error('[daily-brief-card] Loader error:',e);await import(b+'/assets/daily-brief-card-bundle.js?t='+Date.now());}})();`;
+            response.send(loader, {
+                headers: {
+                    'Content-Type': 'application/javascript',
+                    'Cache-Control': 'no-cache',
+                }
+            });
+            return;
+        }
+
+        // Version endpoint for the loader to check for updates
+        if (path === '/assets/card-version') {
+            response.send(JSON.stringify({ version: this.pluginVersion }), {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-cache',
+                }
+            });
+            return;
+        }
+
+        // Serve the actual HA card bundle with long-lived cache
+        // (cache busted by version query param from the loader)
+        if (path === '/assets/daily-brief-card-bundle.js') {
+            const bundle = getHACardBundle();
+            if (bundle) {
+                response.send(bundle, {
+                    headers: {
+                        'Content-Type': 'application/javascript',
+                        'Cache-Control': 'public, max-age=86400',
+                    }
+                });
+            } else {
+                response.send('throw new Error("HA card bundle not available");', {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/javascript' }
+                });
+            }
+            return;
+        }
+
+        // Debug endpoint to check cloud URL (authenticated)
+        if (path === '/brief/cloud-url') {
+            const cloudEndpoint = await endpointManager.getCloudEndpoint(this.nativeId);
+            response.send(JSON.stringify({ cloudUrl: cloudEndpoint }), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+            return;
+        }
+
+        // Test notification endpoint - triggers the full Daily Brief notification pipeline
+        if (path === '/brief/test-notification' && request.method === 'POST') {
+            try {
+                await this.generateAndNotifySummary();
+                response.send(JSON.stringify({ success: true }), {
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            } catch (e) {
+                response.send(JSON.stringify({ error: String(e) }), {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            }
+            return;
+        }
+
+        // Handle timezone auto-detection from browser
+        if (path === '/brief/set-timezone') {
+            try {
+                const urlObj = new URL(url, 'http://localhost');
+                const tz = urlObj.searchParams.get('tz');
+                if (tz) {
+                    this.storage.setItem('dailyBriefTimezone', tz);
+                    this.console.log(`Timezone auto-detected: ${tz}`);
+                }
+            } catch (e) {
+                // Ignore errors
+            }
+            response.send('OK', { headers: { 'Content-Type': 'text/plain' } });
+            return;
+        }
+
+        // Parse date from path: /brief/2024-01-15 or /brief for today
+        // Also check for ?date=YYYY-MM-DD query parameter
+        let targetDate = new Date();
+        const dateMatch = path.match(/\/brief\/(\d{4}-\d{2}-\d{2})/);
+        if (dateMatch) {
+            targetDate = new Date(dateMatch[1] + 'T00:00:00');
+        } else {
+            // Check query parameter
+            try {
+                const urlObj = new URL(url, 'http://localhost');
+                const dateParam = urlObj.searchParams.get('date');
+                if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+                    targetDate = new Date(dateParam + 'T00:00:00');
+                }
+            } catch (e) {
+                // Ignore parse errors
+            }
+        }
+
+        // Get timezone for display
+        const timezone = this.storage.getItem('dailyBriefTimezone') || 'America/Los_Angeles';
+
+        const dateStr = targetDate.toLocaleDateString('en-US', {
+            weekday: 'long',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            timeZone: timezone
+        });
+
+        // Clear all data endpoint
+        if (path === '/brief/clear') {
+            this.notificationStore.clear();
+            this.console.log('[Daily Brief] Storage cleared via HTTP endpoint');
+            response.send(JSON.stringify({ success: true, message: 'All notifications cleared' }), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+            return;
+        }
+
+        // HA Card API endpoint - returns data in format expected by daily-brief-card.js
+        if (path === '/brief/ha-card') {
+            const urlObj = new URL(url, 'http://localhost');
+            // Parse mode: ?mode=incremental|full|normal (default: normal)
+            // Legacy: ?refresh=true maps to mode=full
+            const refreshParam = urlObj.searchParams.get('refresh') === 'true';
+            const modeParam = urlObj.searchParams.get('mode');
+            let mode: 'normal' | 'incremental' | 'full' = 'normal';
+            if (modeParam === 'incremental' || modeParam === 'full') {
+                mode = modeParam;
+            } else if (modeParam) {
+                this.console.warn(`[Daily Brief] Invalid mode="${modeParam}", defaulting to normal`);
+            } else if (refreshParam) {
+                mode = 'full';
+            }
+            const baseUrl = request.rootPath || '';
+            const allNotifications = this.notificationStore.getForDate(targetDate);
+
+            const data = await this.getDailyBriefData(targetDate, timezone, mode, allNotifications, baseUrl);
+
+            response.send(JSON.stringify(data, null, 2), {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            });
+            return;
+        }
+
+        // Video clip endpoint - serves stored clips directly
+        if (path === '/brief/video') {
+            const urlObj = new URL(url, 'http://localhost');
+            const notificationId = urlObj.searchParams.get('id') || '';
+
+            // If notification ID provided, fetch clip from NVR via VideoRecorder
+            if (notificationId) {
+                this.console.log(`[Video] START - Fetching clip for notification: ${notificationId}`);
+
+                // Look up the notification to get timestamp and camera
+                const notification = this.notificationStore.getById(notificationId);
+                if (!notification) {
+                    this.console.warn(`[Video] Notification not found: ${notificationId}`);
+                    response.send(JSON.stringify({ error: 'Notification not found' }), {
+                        code: 404,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+
+                this.console.log(`[Video] Found notification: cameraId=${notification.cameraId}, timestamp=${notification.timestamp}`);
+
+                // Find the camera with VideoRecorder interface
+                const camera = sdk.systemManager.getDeviceById<VideoRecorder & ScryptedDevice>(notification.cameraId);
+                this.console.log(`[Video] Camera found: ${!!camera}, interfaces: ${camera?.interfaces?.join(',')}`);
+
+                if (!camera?.interfaces?.includes('VideoRecorder')) {
+                    this.console.warn(`[Video] Camera ${notification.cameraId} doesn't support VideoRecorder`);
+                    response.send(JSON.stringify({ error: 'Camera does not support video recording' }), {
+                        code: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+
+                const timeoutPromise = <T>(promise: Promise<T>, ms: number, name: string): Promise<T> => {
+                    return Promise.race([
+                        promise,
+                        new Promise<T>((_, reject) =>
+                            setTimeout(() => reject(new Error(`${name} timed out after ${ms}ms`)), ms)
+                        )
+                    ]);
+                };
+
+                try {
+                    // Request a 30-second clip: 10s before detection, 20s after
+                    const startTime = notification.timestamp - 10000;
+                    const duration = 30000;
+
+                    this.console.log(`[Video] Calling getRecordingStream: startTime=${new Date(startTime).toISOString()}, duration=${duration}ms`);
+
+                    // With duration specified, this returns a downloadable stream (per SDK docs)
+                    const recordingMedia = await timeoutPromise(
+                        camera.getRecordingStream({ startTime, duration }),
+                        30000,
+                        'getRecordingStream'
+                    );
+                    this.console.log(`[Video] getRecordingStream returned`);
+
+                    // Get FFmpegInput from the MediaObject
+                    this.console.log(`[Video] Getting FFmpegInput...`);
+                    const ffmpegInput = await mediaManager.convertMediaObjectToJSON<any>(recordingMedia, ScryptedMimeTypes.FFmpegInput);
+                    this.console.log(`[Video] FFmpegInput URL: ${ffmpegInput?.url}`);
+
+                    if (!ffmpegInput?.inputArguments) {
+                        throw new Error('No FFmpegInput available from recording stream');
+                    }
+
+                    // Spawn FFmpeg to convert to streaming-compatible fragmented MP4
+                    // Uses frag_keyframe+empty_moov for streaming-compatible fragmented MP4
+                    this.console.log(`[Video] Spawning FFmpeg for streaming MP4...`);
+                    const { spawn } = await import('child_process');
+
+                    const ffmpegArgs = [
+                        ...ffmpegInput.inputArguments,
+                        '-t', '30',  // Limit to 30 seconds
+                        '-c:v', 'copy',  // Copy video codec (no re-encoding)
+                        '-c:a', 'aac',   // Re-encode audio to AAC for compatibility
+                        '-movflags', '+frag_keyframe+empty_moov',
+                        '-f', 'mp4',
+                        'pipe:1'
+                    ];
+
+                    this.console.log(`[Video] FFmpeg args: ${ffmpegArgs.slice(0, 5).join(' ')}...`);
+
+                    const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+                        stdio: ['ignore', 'pipe', 'pipe']
+                    });
+
+                    let stderrOutput = '';
+                    ffmpeg.stderr.on('data', (data: Buffer) => {
+                        stderrOutput += data.toString();
+                        if (stderrOutput.length > 10000) {
+                            stderrOutput = stderrOutput.slice(-10000);
+                        }
+                    });
+
+                    const console = this.console;
+
+                    // Capture exit code promise BEFORE consuming stdout to avoid race condition
+                    const exitCodePromise = new Promise<number | null>((resolve) => {
+                        ffmpeg.on('close', resolve);
+                    });
+
+                    // Stream FFmpeg output directly to the HTTP response via async generator
+                    async function* streamFfmpegOutput(): AsyncGenerator<Buffer, void> {
+                        let totalBytes = 0;
+                        let timedOut = false;
+                        const timeout = setTimeout(() => {
+                            timedOut = true;
+                            ffmpeg.kill('SIGKILL');
+                        }, 60000);
+
+                        try {
+                            for await (const chunk of ffmpeg.stdout) {
+                                totalBytes += chunk.length;
+                                yield chunk as Buffer;
+                            }
+                        } finally {
+                            clearTimeout(timeout);
+                        }
+
+                        const exitCode = await exitCodePromise;
+
+                        if (timedOut) {
+                            console.error(`[Video] FFmpeg timed out after 60 seconds`);
+                        } else if (exitCode !== 0) {
+                            console.error(`[Video] FFmpeg exited with code ${exitCode}: ${stderrOutput.slice(-500)}`);
+                        }
+                        console.log(`[Video] Streamed clip: ${totalBytes} bytes`);
+                    }
+
+                    response.sendStream(streamFfmpegOutput(), {
+                        headers: {
+                            'Content-Type': 'video/mp4',
+                            'Access-Control-Allow-Origin': '*',
+                            'Cache-Control': 'public, max-age=3600'
+                        }
+                    });
+                    return;
+                } catch (e: any) {
+                    this.console.error(`[Video] Error fetching clip from NVR:`, e);
+                    response.send(JSON.stringify({ error: `Failed to fetch video: ${e?.message || e}` }), {
+                        code: 500,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+            }
+
+            // No notification ID provided
+            response.send(JSON.stringify({ error: 'Missing notification id parameter' }), {
+                code: 400,
+                headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            });
+            return;
+        }
+
+        // Snapshot endpoint - serves poster-quality image with fallback chain:
+        // 1. posterStore (disk read, pre-generated at detection time)
+        // 2. thumbnailB64 (low-res crop fallback, better than nothing)
+        // 3. 404 (no image data — client waits for WebRTC)
+        if (path === '/brief/snapshot') {
+            const urlObj = new URL(url, 'http://localhost');
+            const notificationId = urlObj.searchParams.get('id') || '';
+
+            if (!notificationId) {
+                response.send(JSON.stringify({ error: 'Missing notification id parameter' }), {
+                    code: 400,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+                return;
+            }
+
+            // Look up the notification to get timestamp and camera
+            const notification = this.notificationStore.getById(notificationId);
+            if (!notification) {
+                response.send(JSON.stringify({ error: 'Notification not found' }), {
+                    code: 404,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+                return;
+            }
+
+            try {
+                // 1. Check disk-persisted poster first (fast, no camera lookup needed)
+                const poster = await this.posterStore.get(notificationId);
+                if (poster) {
+                    this.console.log(`[Poster] Disk HIT: ${notificationId} (${Math.round(poster.length / 1024)}KB)`);
+                    response.send(poster, {
+                        headers: {
+                            'Content-Type': 'image/jpeg',
+                            'Content-Length': poster.length.toString(),
+                            'Access-Control-Allow-Origin': '*',
+                            'Cache-Control': 'public, max-age=3600'
+                        }
+                    });
+                    return;
+                }
+
+                // 2. Fall back to thumbnailB64 (low-res crop, better than nothing)
+                if (notification.thumbnailB64) {
+                    this.console.log(`[Poster] No disk poster, falling back to thumbnailB64: ${notificationId}`);
+                    const jpegBuffer = Buffer.from(notification.thumbnailB64, 'base64');
+                    response.send(jpegBuffer, {
+                        headers: {
+                            'Content-Type': 'image/jpeg',
+                            'Content-Length': jpegBuffer.length.toString(),
+                            'Access-Control-Allow-Origin': '*',
+                            'Cache-Control': 'public, max-age=3600'
+                        }
+                    });
+                    return;
+                }
+
+                // 3. No image data at all
+                response.send(JSON.stringify({ error: 'No snapshot available' }), {
+                    code: 404,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+                return;
+            } catch (e: any) {
+                this.console.error(`[Poster] Error fetching snapshot:`, e);
+                response.send(JSON.stringify({ error: `Failed to fetch snapshot: ${e?.message || e}` }), {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+                return;
+            }
+        }
+
+        // WebRTC signaling endpoint - HTTP-based SDP exchange (no WebSocket)
+        // Browser sends offer, we get answer from camera via RTCSignalingChannel
+        if (path === '/brief/webrtc-signal') {
+            // Handle CORS preflight
+            if (request.method === 'OPTIONS') {
+                response.send('', {
+                    code: 200,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                        'Access-Control-Allow-Headers': 'Content-Type'
+                    }
+                });
+                return;
+            }
+
+            try {
+                const body = JSON.parse(request.body || '{}');
+                const { notificationId, offer } = body;
+
+                if (!notificationId || !offer?.sdp) {
+                    response.send(JSON.stringify({ error: 'Missing notificationId or offer.sdp' }), {
+                        code: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+
+                this.console.log(`[WebRTC] Starting signaling for notification: ${notificationId}`);
+
+                // Look up the notification to get camera and timestamp
+                const notification = this.notificationStore.getById(notificationId);
+                if (!notification) {
+                    response.send(JSON.stringify({ error: 'Notification not found' }), {
+                        code: 404,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+
+                // Get the camera with VideoRecorder interface
+                const camera = sdk.systemManager.getDeviceById<VideoRecorder & ScryptedDevice>(notification.cameraId);
+                if (!camera?.interfaces?.includes('VideoRecorder')) {
+                    response.send(JSON.stringify({ error: 'Camera does not support video recording' }), {
+                        code: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+
+                // Request a 30-second clip: 10s before detection, 20s after
+                const startTime = notification.timestamp - 10000;
+                const duration = 30000;
+
+                this.console.log(`[WebRTC] Getting recording stream: startTime=${new Date(startTime).toISOString()}, duration=${duration}ms`);
+
+                // Get recording stream as MediaObject
+                // Set playbackRate: 1 to ensure 1x speed playback (default may be faster for recordings)
+                const recordingMedia = await camera.getRecordingStream({ startTime, duration, playbackRate: 1 });
+
+                // Convert MediaObject to RTCSignalingChannel
+                // The WebRTC plugin's */* → RTCSignalingChannel converter handles this
+                const channel = await mediaManager.convertMediaObject<RTCSignalingChannel>(
+                    recordingMedia,
+                    ScryptedMimeTypes.RTCSignalingChannel
+                );
+
+                if (!channel) {
+                    throw new Error('Failed to convert media to RTCSignalingChannel');
+                }
+
+                // Create signaling session using proper class (required for RPC serialization)
+                const session = new WebRTCSignalingSession({ type: 'offer', sdp: offer.sdp });
+
+                // Start the signaling session
+                await channel.startRTCSignalingSession(session);
+
+                // Wait for the answer (with timeout)
+                const timeoutMs = 20000;
+                const answer = await Promise.race([
+                    session.deferred.promise,
+                    new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error('Timeout waiting for WebRTC answer')), timeoutMs)
+                    )
+                ]);
+
+                if (!answer?.description?.sdp) {
+                    throw new Error('Failed to get answer SDP');
+                }
+
+                this.console.log(`[WebRTC] Signaling complete, returning answer`);
+
+                response.send(JSON.stringify({
+                    answer: {
+                        type: answer.description.type,
+                        sdp: answer.description.sdp
+                    }
+                }), {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*'
+                    }
+                });
+                return;
+
+            } catch (e: any) {
+                this.console.error(`[WebRTC] Signaling error:`, e);
+                response.send(JSON.stringify({ error: e?.message || 'WebRTC signaling failed' }), {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                });
+                return;
+            }
+        }
+
+        // Gallery data endpoint
+        if (path === '/brief/gallery/data') {
+            const result = await handleGalleryDataRequest(url, this.notificationStore, request.rootPath || '');
+            response.send(result.body, {
+                code: result.code,
+                headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
+            });
+            return;
+        }
+
+        // Gallery search endpoint
+        if (path === '/brief/gallery/search') {
+            if (request.method === 'OPTIONS') {
+                response.send('', {
+                    code: 200,
+                    headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' }
+                });
+                return;
+            }
+            const providerIds = this.storageSettings.values.chatCompletions || [];
+            const textProvider = await findTextEmbeddingProvider(providerIds, sdk.systemManager);
+            const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
+            const result = await handleGallerySearchRequest(request.body || '{}', this.notificationStore, textProvider, request.rootPath || '', isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw);
+            response.send(result.body, {
+                code: result.code,
+                headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
+            });
+            return;
+        }
+
+        // Thumbnail endpoint
+        if (path === '/brief/thumbnail') {
+            const result = await handleThumbnailRequest(url, this.notificationStore);
+            if (Buffer.isBuffer(result.body)) {
+                response.send(result.body as Buffer, {
+                    code: result.code,
+                    headers: {
+                        'Content-Type': result.contentType,
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': result.cacheControl || '',
+                    }
+                });
+            } else {
+                response.send(result.body as string, {
+                    code: result.code,
+                    headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            return;
+        }
+
+        if (path === '/brief' || path.startsWith('/brief/')) {
+            const allNotifications = this.notificationStore.getForDate(targetDate);
+            const urlObj = new URL(request.url || '', 'http://localhost');
+            // Parse mode: ?mode=incremental|full|normal (default: normal)
+            // Legacy: ?refresh=true maps to mode=full
+            const refreshParam = urlObj.searchParams.get('refresh') === 'true';
+            const modeParam = urlObj.searchParams.get('mode');
+            let mode: 'normal' | 'incremental' | 'full' = 'normal';
+            if (modeParam === 'incremental' || modeParam === 'full') {
+                mode = modeParam;
+            } else if (modeParam) {
+                this.console.warn(`[Daily Brief] Invalid mode="${modeParam}", defaulting to normal`);
+            } else if (refreshParam) {
+                mode = 'full';
+            }
+
+            this.console.log(`[Daily Brief] ${allNotifications.length} notifications, mode=${mode}`);
+
+            // Check for JSON API request (keep simple - doesn't need full DailyBriefData)
+            if (path.endsWith('/api') || urlObj.searchParams.get('format') === 'json') {
+                const stats = this.notificationStore.getStats(targetDate);
+                const cached = this.notificationStore.getCachedSummary(targetDate, timezone);
+                response.send(JSON.stringify({ date: dateStr, stats, notifications: allNotifications, summary: cached?.summary, highlights: cached?.highlights }, null, 2), {
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                return;
+            }
+
+            // Use shared helper for data fetching and transformation
+            const data = await this.getDailyBriefData(targetDate, timezone, mode, allNotifications, request.rootPath || '');
+
+            // Build refresh and catch-up URLs
+            const datePath = dateMatch ? '/' + dateMatch[1] : '';
+            const refreshUrl = `${request.rootPath}/brief${datePath}?refresh=true`;
+            const catchUpUrl = `${request.rootPath}/brief${datePath}?mode=incremental`;
+
+            // HTML response
+            this.console.log(`[Daily Brief] Generating HTML response (narrative: ${data.narrative?.length || 0} segments)`);
+            const html = generateDailyBriefHTML(
+                data.eventCount,
+                data.hasDailyBrief ? data.summary : null,
+                data.highlights,
+                data.generatedAt,
+                refreshUrl,
+                timezone,
+                data.overview,
+                data.narrative,
+                catchUpUrl
+            );
+            this.console.log(`[Daily Brief] Sending HTML (${html.length} bytes)`);
+            response.send(html, {
+                headers: { 'Content-Type': 'text/html' }
+            });
+            return;
+        }
+
+        // Default: redirect to /brief
+        response.send(`<html><head><meta http-equiv="refresh" content="0;url=${request.rootPath}/brief"></head></html>`, {
+            headers: { 'Content-Type': 'text/html' }
+        });
+        } catch (e) {
+            this.console.error(`[Daily Brief] Unhandled error in request handler:`, e);
+            // Return JSON for API endpoints, plain text for HTML
+            if (path.includes('/video') || path.includes('/api') || path.includes('format=json')) {
+                response.send(JSON.stringify({ error: 'Internal server error: ' + (e as Error).message }), {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            } else {
+                response.send('Internal error', {
+                    code: 500,
+                    headers: { 'Content-Type': 'text/plain' }
+                });
+            }
+        }
+    }
 
     storageSettings = new StorageSettings(this, {
         enabled: {
@@ -486,7 +1463,88 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             description: 'Include the original notification text in the LLM prompt for context',
             defaultValue: true,
             group: 'Advanced',
-        }
+        },
+        dailyBriefUrl: {
+            title: 'Daily Brief URL (Local)',
+            type: 'html',
+            description: 'Local network URL - requires Scrypted login',
+            group: 'Daily Brief',
+        },
+        dailyBriefCloudUrl: {
+            title: 'Daily Brief URL (External)',
+            type: 'html',
+            description: 'External URL via Scrypted Cloud - requires Scrypted Cloud login',
+            group: 'Daily Brief',
+        },
+        haCardSetup: {
+            title: 'HA Card Setup',
+            type: 'html',
+            description: 'Instructions to add the Daily Brief card to Home Assistant',
+            group: 'Daily Brief',
+        },
+        dailyBriefEnabled: {
+            title: 'Enable Daily Brief Notifications',
+            type: 'boolean',
+            description: 'Send a notification with daily summary at scheduled time',
+            defaultValue: false,
+            group: 'Daily Brief',
+        },
+        dailyBriefTimezone: {
+            title: 'Timezone',
+            type: 'string',
+            description: 'Your local timezone (auto-detected when you visit the Daily Brief page)',
+            defaultValue: 'America/Los_Angeles',
+            group: 'Daily Brief',
+        },
+        dailyBriefHour: {
+            title: 'Notification Time (Hour)',
+            type: 'number',
+            description: 'Hour to send daily brief (24h format, e.g., 20 = 8pm)',
+            defaultValue: 20,
+            group: 'Daily Brief',
+        },
+        dailyBriefNotifier: {
+            title: 'Notifier for Daily Brief',
+            type: 'device',
+            deviceFilter: `interfaces.includes('Notifier')`,
+            description: 'Select which notifier to use for Daily Brief notifications',
+            group: 'Daily Brief',
+        },
+        dailyBriefTestNotification: {
+            title: 'Test Notification',
+            type: 'button',
+            description: 'Send a test notification to verify your notifier is working',
+            group: 'Daily Brief',
+        },
+        dailyBriefNotificationUrl: {
+            title: 'Notification Click URL',
+            type: 'string',
+            description: 'URL to open when notification is tapped. Set to the HA dashboard path where your Daily Brief card lives.',
+            defaultValue: '/daily-brief/0',
+            group: 'Daily Brief',
+        },
+        dailyBriefGenerationInterval: {
+            title: 'Background Generation Interval',
+            type: 'number',
+            description: 'How often to regenerate the Daily Brief summary in the background (in minutes). Set to 0 to disable.',
+            defaultValue: 60,
+            placeholder: '60',
+            group: 'Daily Brief',
+        },
+        dailyBriefCustomPrompt: {
+            title: 'Custom Instructions',
+            type: 'textarea',
+            description: 'Add custom context for the Daily Brief. e.g. "The small white dog is Lily" or "Ignore cars on the Sidewalk camera"',
+            defaultValue: '',
+            group: 'Daily Brief',
+        },
+        retentionDays: {
+            title: 'Gallery Retention (Days)',
+            type: 'number',
+            description: 'How many days to keep notifications, posters, and embeddings (default: 3)',
+            defaultValue: 3,
+            group: 'Daily Brief',
+        },
     });
 
     async getSettings() {
@@ -496,6 +1554,51 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             if (s?.key)
                 byKey.set(s.key, s);
         }
+
+        // Populate Daily Brief URLs dynamically - HTML for clickable links
+        const urlSetting = byKey.get('dailyBriefUrl');
+        if (urlSetting) {
+            try {
+                const endpoint = await endpointManager.getLocalEndpoint(this.nativeId, { public: true });
+                const urlStr = `${endpoint.replace(/\/+$/, '')}/brief`;
+                urlSetting.value = `<a href="${urlStr}" target="_blank">Open Daily Brief (Local)</a>`;
+            } catch {
+                urlSetting.value = '(URL not available yet)';
+            }
+        }
+
+        // Populate cloud URL (authenticated access - requires Scrypted Cloud login)
+        const cloudUrlSetting = byKey.get('dailyBriefCloudUrl');
+        if (cloudUrlSetting) {
+            try {
+                const cloudEndpoint = await endpointManager.getPublicCloudEndpoint(this.nativeId);
+                const cloudUrl = new URL(cloudEndpoint);
+                // Remove /public/ from path and strip query params (user_token) for authenticated access
+                cloudUrl.pathname = cloudUrl.pathname.replace('/public/', '/').replace(/\/?$/, '/brief');
+                cloudUrl.search = '';
+                const urlStr = cloudUrl.toString();
+                cloudUrlSetting.value = `<a href="${urlStr}" target="_blank">Open Daily Brief</a>`;
+            } catch {
+                cloudUrlSetting.value = '(Scrypted Cloud not configured)';
+            }
+        }
+
+        // Populate HA Card setup instructions
+        const haSetupSetting = byKey.get('haCardSetup');
+        if (haSetupSetting) {
+            haSetupSetting.value = `
+<div style="font-size: 12px; line-height: 1.5;">
+<strong>Step 1:</strong> Add Lovelace Resource<br>
+<code style="background: rgba(128,128,128,0.3); padding: 2px 6px; border-radius: 3px; font-size: 11px;">/api/scrypted/TOKEN/endpoint/@rmaher001/scrypted-llm-notifier/assets/daily-brief-card.js</code>
+<br><br>
+<strong>Step 2:</strong> Add Card to Dashboard<br>
+<pre style="background: rgba(128,128,128,0.3); padding: 8px; border-radius: 4px; font-size: 11px; margin: 4px 0; overflow-x: auto;">type: custom:daily-brief-card
+endpoint: /api/scrypted/TOKEN/endpoint/@rmaher001/scrypted-llm-notifier
+scrypted_token: TOKEN</pre>
+<small>Replace <strong>TOKEN</strong> with your Scrypted token from HA Settings → Devices → Scrypted integration</small>
+</div>`;
+        }
+
         const orderedKeys = [
             // General first
             'chatCompletions',
@@ -506,6 +1609,19 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             'llmTimeoutMs',
             'snapshotMode',
             'includeOriginalMessage',
+            // Daily Brief
+            'dailyBriefUrl',
+            'dailyBriefCloudUrl',
+            'haCardSetup',
+            'dailyBriefEnabled',
+            'dailyBriefNotifier',
+            'dailyBriefTestNotification',
+            'dailyBriefNotificationUrl',
+            'dailyBriefTimezone',
+            'dailyBriefHour',
+            'dailyBriefGenerationInterval',
+            'dailyBriefCustomPrompt',
+            'retentionDays',
         ];
         const ordered: any[] = [];
         for (const k of orderedKeys) {
@@ -520,8 +1636,29 @@ Avoid generic phrases like "motion detected" or "person detected"`,
         return ordered;
     }
 
-    putSetting(key: string, value: SettingValue): Promise<void> {
-        return this.storageSettings.putSetting(key, value);
+    async putSetting(key: string, value: SettingValue): Promise<void> {
+        if (key === 'dailyBriefTestNotification') {
+            await this.sendTestNotification();
+            return;
+        }
+
+        await this.storageSettings.putSetting(key, value);
+
+        // Restart timers if relevant settings changed
+        if (key === 'dailyBriefGenerationInterval') {
+            this.startDailyBriefTimer();
+        } else if (key === 'dailyBriefEnabled' || key === 'dailyBriefHour' || key === 'dailyBriefTimezone') {
+            this.scheduleDailySummary();
+        } else if (key === 'retentionDays') {
+            this.notificationStore.setRetentionDays(Number(value) || 3);
+            this.notificationStore.pruneNow();
+            this.startPruneTimer();
+        }
+    }
+
+    private async sendTestNotification() {
+        this.console.log('[Daily Brief] Test notification triggered');
+        await this.generateAndNotifySummary();
     }
 
     selectProvider() {

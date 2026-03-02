@@ -11,7 +11,6 @@ out/
 .env
 .env.local
 *.log
-deploy.sh
 
 # IDE
 .vscode/
