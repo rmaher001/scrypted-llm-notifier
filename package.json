@@ -1,6 +1,6 @@
 {
   "name": "@rmaher001/scrypted-llm-notifier",
-  "version": "0.3.45",
+  "version": "0.3.46",
   "description": "Enhance notifications with LLM-generated descriptions of detection images",
   "author": "rmaher001",
   "repository": {
@@ -16,6 +16,7 @@
   "files": [
     "out/main.nodejs.js",
     "out/plugin.zip",
+    "dist/plugin.zip",
     "ha-card/daily-brief-card.js",
     "ha-card/video-player.js",
     "README.md",

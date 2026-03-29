@@ -4,7 +4,7 @@
  * All rendering (timeline, gallery, video, badges) is handled by the web UI.
  */
 
-const CARD_VERSION = '0.3.45';
+const CARD_VERSION = '0.3.46';
 
 class DailyBriefCard extends HTMLElement {
   constructor() {
