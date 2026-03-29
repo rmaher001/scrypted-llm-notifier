@@ -71,9 +71,12 @@ export function prioritySelectFromBucket(
 ): CandidateWithPriority[] {
     if (notifications.length === 0) return [];
 
+    // Filter to group primaries and ungrouped (avoid wasting slots on duplicates)
+    const groupAware = notifications.filter(n => !n.groupId || n.isGroupPrimary);
+
     // If we have fewer than count, return all as priority (they're all we have)
-    if (notifications.length <= count) {
-        return notifications.map(n => ({ notification: n, isPriority: true }));
+    if (groupAware.length <= count) {
+        return groupAware.map(n => ({ notification: n, isPriority: true }));
     }
 
     const selected: CandidateWithPriority[] = [];
@@ -95,7 +98,7 @@ export function prioritySelectFromBucket(
 
     // Priority 1: Named people (not generic "Person", "Man", "Woman")
     // Match names like "Richard in garage" or "Zoia at kitchen" - capitalized name followed by space or end
-    const namedPeople = notifications.filter(n =>
+    const namedPeople = groupAware.filter(n =>
         n.llmTitle &&
         /^[A-Z][a-z]+(\s|$)/.test(n.llmTitle) &&
         !n.llmTitle.startsWith('Person') &&
@@ -105,7 +108,7 @@ export function prioritySelectFromBucket(
     namedPeople.forEach(tryAddPriority);
 
     // Priority 2: Animal detections
-    const animals = notifications.filter(n =>
+    const animals = groupAware.filter(n =>
         n.llmTitle?.toLowerCase().includes('animal') ||
         n.llmTitle?.toLowerCase().includes('dog') ||
         n.llmTitle?.toLowerCase().includes('cat') ||
@@ -115,11 +118,11 @@ export function prioritySelectFromBucket(
     animals.forEach(tryAddPriority);
 
     // Priority 3: Vehicle/delivery detections
-    const vehicles = notifications.filter(isVehicleNotification);
+    const vehicles = groupAware.filter(isVehicleNotification);
     vehicles.forEach(tryAddPriority);
 
     // Fill remaining with random sample (marked as non-priority)
-    const remaining = notifications.filter(n => !used.has(n.id));
+    const remaining = groupAware.filter(n => !used.has(n.id));
     const shuffled = [...remaining].sort(() => Math.random() - 0.5);
     shuffled.slice(0, count - selected.length).forEach(tryAddRandom);
 

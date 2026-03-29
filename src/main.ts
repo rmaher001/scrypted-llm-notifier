@@ -37,7 +37,10 @@ import { getNaturalPeriods, matchSegmentToPeriod, buildFrozenContext, createSumm
 import { generateDailyBriefHTML, getHACardBundle } from './daily-brief/html-generator';
 import { LLMNotifier } from './llm-notifier';
 import { PosterStore } from './poster-store';
-import { handleGalleryDataRequest, handleGallerySearchRequest, handleThumbnailRequest, findTextEmbeddingProvider } from './gallery';
+import { PersonStore } from './person-store';
+import { NotificationBuffer, BufferedNotification, DeliveryTarget } from './notification-buffer';
+import { groupNotifications, NotificationGroup } from './notification-grouper';
+import { handleGalleryDataRequest, handleGallerySearchRequest, handleThumbnailRequest, handlePeopleRequest, handlePeoplePhotoRequest } from './gallery';
 
 export default class LLMNotifierProvider extends ScryptedDeviceBase implements MixinProvider, Settings, HttpRequestHandler {
     private currentProviderIndex = 0;
@@ -55,13 +58,17 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
     });
     inFlightRequests = new Map<string, Promise<{title: string, subtitle: string, body: string, detailedDescription: string, clarity?: {score: number, reason: string}}>>();
     posterStore: PosterStore;
+    personStore: PersonStore;
     notificationStore: NotificationStore;
+    notificationBuffer?: NotificationBuffer;
     private pluginVersion: string;
+    private cachedLocalEndpoint: string | null = null;
 
     constructor(nativeId?: string) {
         super(nativeId);
         this.notificationStore = new NotificationStore(this.storage);
         this.posterStore = new PosterStore(() => mediaManager.getFilesPath());
+        this.personStore = new PersonStore(() => mediaManager.getFilesPath());
         try {
             this.pluginVersion = require('../package.json').version;
         } catch {
@@ -78,8 +85,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             if (n > 0) this.console.log(`[Poster] Pruned ${n} orphaned posters`);
         }).catch(e => this.console.warn('[Poster] Prune failed:', e));
 
-        // Log endpoint URL on startup
-        this.logEndpoint();
+        // Cache endpoint URLs and log on startup (fire-and-forget)
+        this.refreshEndpointCache();
 
         // Schedule daily brief notification
         this.scheduleDailySummary();
@@ -89,14 +96,26 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
         // Start periodic poster prune timer
         this.startPruneTimer();
+
+        // Initialize notification buffer for grouping (if enabled)
+        const groupingWindow = parseInt(this.storage.getItem('groupingWindow') || '0', 10);
+        if (!isNaN(groupingWindow) && groupingWindow > 0) {
+            this.notificationBuffer = new NotificationBuffer(
+                groupingWindow * 1000,
+                async (notifications, targets) => {
+                    await this.handleBufferFlush(notifications, targets);
+                },
+            );
+            this.console.log(`[Grouping] Buffer enabled with ${groupingWindow}s window`);
+        }
     }
 
-    private async logEndpoint() {
+    private async refreshEndpointCache(): Promise<void> {
         try {
-            const endpoint = await endpointManager.getLocalEndpoint(this.nativeId, { public: true });
-            this.console.log(`Daily Brief available at: ${endpoint.replace(/\/+$/, '')}/brief`);
-        } catch (e) {
-            // Ignore - endpoint may not be ready yet
+            this.cachedLocalEndpoint = await endpointManager.getLocalEndpoint(this.nativeId);
+            this.console.log(`Daily Brief available at: ${this.cachedLocalEndpoint.replace(/\/+$/, '')}/brief`);
+        } catch {
+            // Endpoint may not be ready yet
         }
     }
 
@@ -137,6 +156,19 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         const hour = (this.storageSettings.values as any).dailyBriefHour ?? 20;
         const ms = this.msUntilLocalTime(hour, timezone);
         const hoursUntil = Math.round(ms / 3600000 * 10) / 10;
+
+        // Check if we missed today's notification (e.g. plugin restarted after scheduled hour)
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone }); // YYYY-MM-DD
+        const lastSentDate = this.storage.getItem('lastDailyBriefDate');
+        if (lastSentDate !== todayStr && hoursUntil > 23) {
+            // hoursUntil > 23 means we're past the scheduled hour (timer wrapped to tomorrow)
+            this.console.log(`[Daily Brief] Missed today's ${hour}:00 notification (last sent: ${lastSentDate || 'never'}), firing now`);
+            this.summaryScheduleTimeout = setTimeout(async () => {
+                await this.generateAndNotifySummary();
+                this.scheduleDailySummary(); // Reschedule for tomorrow
+            }, 5000); // Short delay to let plugin finish initializing
+            return;
+        }
 
         this.console.log(`Daily Brief scheduled in ${hoursUntil}h (${timezone}, ${hour}:00)`);
 
@@ -513,6 +545,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             // Send notification
             this.console.log('[Daily Brief] Summary generated, sending notification...');
             await this.sendDailyBriefNotification(today, cached.summary, cached.notificationCount);
+            // Record sent date so we don't re-send on restart
+            this.storage.setItem('lastDailyBriefDate', today.toLocaleDateString('en-CA', { timeZone: timezone }));
             this.console.log('[Daily Brief] Summary generated and notification sent');
         } catch (e) {
             this.console.error('Failed to generate scheduled summary:', e);
@@ -1269,6 +1303,38 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             }
         }
 
+        // People endpoint
+        if (path === '/brief/people') {
+            const enableFaceId = this.storageSettings.values.enableLlmFaceId === true;
+            const result = await handlePeopleRequest(this.personStore, enableFaceId, request.rootPath || '');
+            response.send(result.body, {
+                code: result.code,
+                headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
+            });
+            return;
+        }
+
+        // People photo endpoint
+        if (path === '/brief/people/photo') {
+            const result = await handlePeoplePhotoRequest(url, this.personStore);
+            if (Buffer.isBuffer(result.body)) {
+                response.send(result.body as Buffer, {
+                    code: result.code,
+                    headers: {
+                        'Content-Type': result.contentType,
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': result.cacheControl || '',
+                    }
+                });
+            } else {
+                response.send(result.body as string, {
+                    code: result.code,
+                    headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
+                });
+            }
+            return;
+        }
+
         // Gallery data endpoint
         if (path === '/brief/gallery/data') {
             const result = await handleGalleryDataRequest(url, this.notificationStore, request.rootPath || '');
@@ -1288,10 +1354,10 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 });
                 return;
             }
-            const providerIds = this.storageSettings.values.chatCompletions || [];
-            const textProvider = await findTextEmbeddingProvider(providerIds, sdk.systemManager);
             const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
-            const result = await handleGallerySearchRequest(request.body || '{}', this.notificationStore, textProvider, request.rootPath || '', isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw);
+            const geminiApiKey = this.storageSettings.values.geminiEmbeddingApiKey;
+            const geminiConfig = geminiApiKey ? { apiKey: geminiApiKey } : undefined;
+            const result = await handleGallerySearchRequest(request.body || '{}', this.notificationStore, request.rootPath || '', isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw, geminiConfig);
             response.send(result.body, {
                 code: result.code,
                 headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
@@ -1349,12 +1415,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             }
 
             // Use shared helper for data fetching and transformation
-            const data = await this.getDailyBriefData(targetDate, timezone, mode, allNotifications, request.rootPath || '');
-
-            // Build refresh and catch-up URLs
-            const datePath = dateMatch ? '/' + dateMatch[1] : '';
-            const refreshUrl = `${request.rootPath}/brief${datePath}?refresh=true`;
-            const catchUpUrl = `${request.rootPath}/brief${datePath}?mode=incremental`;
+            // Don't pass baseUrl — web UI derives it at runtime from window.location.pathname
+            const data = await this.getDailyBriefData(targetDate, timezone, mode, allNotifications);
 
             // HTML response
             this.console.log(`[Daily Brief] Generating HTML response (narrative: ${data.narrative?.length || 0} segments)`);
@@ -1363,11 +1425,10 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 data.hasDailyBrief ? data.summary : null,
                 data.highlights,
                 data.generatedAt,
-                refreshUrl,
                 timezone,
                 data.overview,
                 data.narrative,
-                catchUpUrl
+                this.pluginVersion,
             );
             this.console.log(`[Daily Brief] Sending HTML (${html.length} bytes)`);
             response.send(html, {
@@ -1464,16 +1525,31 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             defaultValue: true,
             group: 'Advanced',
         },
-        dailyBriefUrl: {
-            title: 'Daily Brief URL (Local)',
-            type: 'html',
-            description: 'Local network URL - requires Scrypted login',
-            group: 'Daily Brief',
+        groupingWindow: {
+            title: 'Grouping Window (sec)',
+            type: 'number',
+            description: 'Buffer notifications for this many seconds, then group related events via LLM to reduce notification noise. Set to 0 to disable (instant delivery).',
+            defaultValue: 0,
+            group: 'Advanced',
         },
-        dailyBriefCloudUrl: {
-            title: 'Daily Brief URL (External)',
+        enableLlmFaceId: {
+            title: 'LLM Person Identification',
+            type: 'boolean',
+            description: 'When enabled, auto-curates reference photos from Scrypted face identifications, then uses the LLM to identify unrecognized persons by comparing against known faces.',
+            defaultValue: false,
+            group: 'Advanced',
+        },
+        verboseLogging: {
+            title: 'Verbose Logging',
+            type: 'boolean',
+            description: 'Log detailed debug information including full LLM responses, image resize stats, and notification processing details.',
+            defaultValue: false,
+            group: 'Advanced',
+        },
+        dailyBriefUrl: {
+            title: 'Daily Brief URL',
             type: 'html',
-            description: 'External URL via Scrypted Cloud - requires Scrypted Cloud login',
+            description: 'Opens the Daily Brief page - requires Scrypted login',
             group: 'Daily Brief',
         },
         haCardSetup: {
@@ -1545,9 +1621,18 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             defaultValue: 3,
             group: 'Daily Brief',
         },
+        geminiEmbeddingApiKey: {
+            title: 'Gemini Embedding API Key',
+            description: 'API key for Gemini multimodal embeddings (gemini-embedding-2-preview). Enables high-quality semantic search using both image and text. Get a key at https://aistudio.google.com/apikey',
+            type: 'password',
+            group: 'Search',
+        },
     });
 
     async getSettings() {
+        // Refresh endpoint cache in background (keeps URLs fresh without blocking)
+        this.refreshEndpointCache();
+
         const settings: any[] = await this.storageSettings.getSettings();
         const byKey = new Map<string, any>();
         for (const s of settings) {
@@ -1555,47 +1640,27 @@ Avoid generic phrases like "motion detected" or "person detected"`,
                 byKey.set(s.key, s);
         }
 
-        // Populate Daily Brief URLs dynamically - HTML for clickable links
+        // Populate Daily Brief URLs from cache (no network calls — fast getSettings)
         const urlSetting = byKey.get('dailyBriefUrl');
         if (urlSetting) {
-            try {
-                const endpoint = await endpointManager.getLocalEndpoint(this.nativeId, { public: true });
-                const urlStr = `${endpoint.replace(/\/+$/, '')}/brief`;
-                urlSetting.value = `<a href="${urlStr}" target="_blank">Open Daily Brief (Local)</a>`;
-            } catch {
+            if (this.cachedLocalEndpoint) {
+                // Use relative path only — the SDK returns an absolute URL with IP:port
+                // but users may access Scrypted via hostname or reverse proxy
+                const localPath = new URL(this.cachedLocalEndpoint).pathname.replace(/\/+$/, '');
+                const urlStr = `${localPath}/brief`;
+                urlSetting.value = `<a href="${urlStr}" target="_blank">Open Daily Brief</a>`;
+            } else {
                 urlSetting.value = '(URL not available yet)';
             }
         }
 
-        // Populate cloud URL (authenticated access - requires Scrypted Cloud login)
-        const cloudUrlSetting = byKey.get('dailyBriefCloudUrl');
-        if (cloudUrlSetting) {
-            try {
-                const cloudEndpoint = await endpointManager.getPublicCloudEndpoint(this.nativeId);
-                const cloudUrl = new URL(cloudEndpoint);
-                // Remove /public/ from path and strip query params (user_token) for authenticated access
-                cloudUrl.pathname = cloudUrl.pathname.replace('/public/', '/').replace(/\/?$/, '/brief');
-                cloudUrl.search = '';
-                const urlStr = cloudUrl.toString();
-                cloudUrlSetting.value = `<a href="${urlStr}" target="_blank">Open Daily Brief</a>`;
-            } catch {
-                cloudUrlSetting.value = '(Scrypted Cloud not configured)';
-            }
-        }
 
         // Populate HA Card setup instructions
         const haSetupSetting = byKey.get('haCardSetup');
         if (haSetupSetting) {
             haSetupSetting.value = `
 <div style="font-size: 12px; line-height: 1.5;">
-<strong>Step 1:</strong> Add Lovelace Resource<br>
-<code style="background: rgba(128,128,128,0.3); padding: 2px 6px; border-radius: 3px; font-size: 11px;">/api/scrypted/TOKEN/endpoint/@rmaher001/scrypted-llm-notifier/assets/daily-brief-card.js</code>
-<br><br>
-<strong>Step 2:</strong> Add Card to Dashboard<br>
-<pre style="background: rgba(128,128,128,0.3); padding: 8px; border-radius: 4px; font-size: 11px; margin: 4px 0; overflow-x: auto;">type: custom:daily-brief-card
-endpoint: /api/scrypted/TOKEN/endpoint/@rmaher001/scrypted-llm-notifier
-scrypted_token: TOKEN</pre>
-<small>Replace <strong>TOKEN</strong> with your Scrypted token from HA Settings → Devices → Scrypted integration</small>
+See <a href="https://github.com/rmaher001/scrypted-llm-notifier#ha-card-setup" target="_blank">README</a> for HA Card setup instructions.
 </div>`;
         }
 
@@ -1609,9 +1674,10 @@ scrypted_token: TOKEN</pre>
             'llmTimeoutMs',
             'snapshotMode',
             'includeOriginalMessage',
+            'groupingWindow',
+            'enableLlmFaceId',
             // Daily Brief
             'dailyBriefUrl',
-            'dailyBriefCloudUrl',
             'haCardSetup',
             'dailyBriefEnabled',
             'dailyBriefNotifier',
@@ -1653,12 +1719,155 @@ scrypted_token: TOKEN</pre>
             this.notificationStore.setRetentionDays(Number(value) || 3);
             this.notificationStore.pruneNow();
             this.startPruneTimer();
+        } else if (key === 'groupingWindow') {
+            const windowSec = Math.max(0, Number(value) || 0);
+            await this.notificationBuffer?.flush();
+            if (windowSec > 0) {
+                this.notificationBuffer = new NotificationBuffer(
+                    windowSec * 1000,
+                    async (notifications, targets) => {
+                        await this.handleBufferFlush(notifications, targets);
+                    },
+                );
+                this.console.log(`[Grouping] Buffer updated: ${windowSec}s window`);
+            } else {
+                this.notificationBuffer = undefined;
+                this.console.log('[Grouping] Buffer disabled (instant delivery)');
+            }
         }
     }
 
     private async sendTestNotification() {
         this.console.log('[Daily Brief] Test notification triggered');
         await this.generateAndNotifySummary();
+    }
+
+    // ---- Notification Grouping (flush handler) ----
+
+    private async handleBufferFlush(
+        notifications: BufferedNotification[],
+        targets: DeliveryTarget[],
+    ): Promise<void> {
+        if (notifications.length === 1) {
+            // Single notification — deliver to each target with its own options/media/icon
+            const n = notifications[0];
+            const notifierTargets = targets.filter(t => t.notificationId === n.id);
+            for (const t of notifierTargets) {
+                try {
+                    await t.notifier.sendNotification(n.title, t.options, t.media, t.icon);
+                } catch (e) {
+                    this.console.warn(`[Grouping] Delivery failed for ${n.id}:`, e);
+                }
+            }
+            return;
+        }
+
+        // Multiple notifications — group via LLM
+        try {
+            const provider = this.selectProvider();
+            if (!provider) throw new Error('No LLM provider configured for notification grouping');
+            const groupStart = Date.now();
+            const groups = await groupNotifications(notifications, provider);
+            const groupLatencyMs = Date.now() - groupStart;
+
+            // Update store with group metadata and resolve primaries (single pass)
+            const groupPrimaries = new Map<NotificationGroup, BufferedNotification>();
+            for (const group of groups) {
+                const primaryId = this.pickPrimaryNotification(group.notificationIds, notifications);
+                const groupId = `group-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                this.notificationStore.updateGroup(group.notificationIds, groupId, primaryId);
+                groupPrimaries.set(
+                    group,
+                    notifications.find(n => n.id === primaryId)
+                        ?? notifications.find(n => group.notificationIds.includes(n.id))
+                        ?? notifications[0],
+                );
+            }
+
+            // Deliver each group — each notifier gets its own options/media/icon
+            // from its target for the primary notification (preserves device-specific
+            // metadata like data.ha for HA notifiers)
+            for (const group of groups) {
+                const primary = groupPrimaries.get(group)!;
+                const eventCount = group.notificationIds.length;
+                const deliveryTitle = eventCount > 1
+                    ? `${group.title} [${eventCount} events]`
+                    : group.title;
+
+                // Collect targets belonging to this group, grouped by notifier
+                const groupTargets = targets.filter(t => group.notificationIds.includes(t.notificationId));
+                const byNotifier = new Map<any, DeliveryTarget[]>();
+                for (const t of groupTargets) {
+                    const list = byNotifier.get(t.notifier) || [];
+                    list.push(t);
+                    byNotifier.set(t.notifier, list);
+                }
+
+                for (const [notifier, notifierTargets] of byNotifier) {
+                    // Prefer this notifier's target for the primary notification
+                    const target = notifierTargets.find(t => t.notificationId === primary.id)
+                        ?? notifierTargets[0];
+                    // Merge grouped content into a copy to avoid mutating shared references
+                    const mergedOptions = { ...target.options, subtitle: group.subtitle, body: group.body };
+                    try {
+                        await notifier.sendNotification(
+                            deliveryTitle,
+                            mergedOptions,
+                            target.media,
+                            target.icon,
+                        );
+                    } catch (e) {
+                        this.console.warn(`[Grouping] Group delivery failed:`, e);
+                    }
+                }
+            }
+
+            // Log detailed stats: camera breakdown, LLM latency, group details
+            const cameraBreakdown = new Map<string, number>();
+            for (const n of notifications) {
+                cameraBreakdown.set(n.cameraName, (cameraBreakdown.get(n.cameraName) || 0) + 1);
+            }
+            const cameraStr = Array.from(cameraBreakdown.entries())
+                .map(([cam, count]) => `${cam}:${count}`)
+                .join(', ');
+            const groupDetails = groups.map(g =>
+                `"${g.title}" (${g.notificationIds.length} events)`,
+            ).join(', ');
+            this.console.log(
+                `[Grouping] ${notifications.length} notifications → ${groups.length} groups ` +
+                `in ${groupLatencyMs}ms | cameras: ${cameraStr} | groups: ${groupDetails}`,
+            );
+        } catch (e) {
+            // Grouping LLM call failed — deliver all individually (delivery guarantee)
+            this.console.warn('[Grouping] LLM grouping failed, delivering individually:', e);
+            for (const n of notifications) {
+                const notifierTargets = targets.filter(t => t.notificationId === n.id);
+                for (const t of notifierTargets) {
+                    try {
+                        await t.notifier.sendNotification(n.title, t.options, t.media, t.icon);
+                    } catch (deliveryErr) {
+                        this.console.warn(`[Grouping] Fallback delivery failed for ${n.id}:`, deliveryErr);
+                    }
+                }
+            }
+        }
+    }
+
+    private pickPrimaryNotification(notificationIds: string[], notifications: BufferedNotification[]): string {
+        // Pick the notification with the highest clarity score
+        let bestId = notificationIds[0];
+        let bestScore = -1;
+
+        for (const n of notifications) {
+            if (notificationIds.includes(n.id) && n.clarity) {
+                if (n.clarity.score > bestScore) {
+                    bestScore = n.clarity.score;
+                    bestId = n.id;
+                }
+            }
+        }
+
+        return bestId;
     }
 
     selectProvider() {

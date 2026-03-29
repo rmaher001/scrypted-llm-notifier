@@ -241,6 +241,23 @@ export class NotificationStore {
         return this.notifications.find(n => n.id === id);
     }
 
+    getByGroupId(groupId: string): StoredNotification[] {
+        if (!groupId) return [];
+        return this.notifications.filter(n => n.groupId === groupId);
+    }
+
+    // Update group metadata for a set of notification IDs
+    updateGroup(notificationIds: string[], groupId: string, primaryId: string): void {
+        const idSet = new Set(notificationIds);
+        for (const n of this.notifications) {
+            if (idSet.has(n.id)) {
+                n.groupId = groupId;
+                n.isGroupPrimary = (n.id === primaryId);
+            }
+        }
+        this.save();
+    }
+
     // Mark a notification as having a poster on disk (for NVR backfill)
     markHasPoster(id: string) {
         const n = this.notifications.find(n => n.id === id);

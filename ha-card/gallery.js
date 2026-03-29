@@ -36,9 +36,12 @@ class Gallery {
     this._debounceTimer = null;
     this._initialized = false;
     this._loading = false;
+    this._savedState = null;
+    this._inGroupView = false;
 
     // DOM refs (set by _renderShell)
     this._gridEl = null;
+    this._backBtn = null;
     this._searchInput = null;
     this._cameraSelect = null;
     this._typeSelect = null;
@@ -170,6 +173,7 @@ class Gallery {
     var shell = document.createElement('div');
     shell.className = 'gallery-shell';
     shell.innerHTML =
+      '<div class="gallery-controls-sticky">' +
       '<div class="gallery-search-bar">' +
         '<input type="text" class="gallery-search-input" placeholder="Search detections..." />' +
         '<span class="gallery-mode-indicator"></span>' +
@@ -179,6 +183,7 @@ class Gallery {
         '<select class="gallery-filter gallery-type-filter"><option value="">All Types</option></select>' +
         '<select class="gallery-filter gallery-name-filter"><option value="">All Names</option></select>' +
       '</div>' +
+      '</div>' +
       '<div class="gallery-status"></div>' +
       '<div class="gallery-grid"></div>' +
       '<div class="gallery-load-more-wrap">' +
@@ -186,6 +191,15 @@ class Gallery {
       '</div>';
 
     this._containerEl.appendChild(shell);
+
+    // Set sticky offset based on header + tab bar heights
+    var stickyWrap = shell.querySelector('.gallery-controls-sticky');
+    if (stickyWrap) {
+      var header = document.querySelector('.header');
+      var tabBar = document.querySelector('.tab-bar');
+      var offset = (header ? header.offsetHeight : 0) + (tabBar ? tabBar.offsetHeight : 0);
+      stickyWrap.style.top = offset + 'px';
+    }
 
     this._gridEl = shell.querySelector('.gallery-grid');
     this._searchInput = shell.querySelector('.gallery-search-input');
@@ -230,10 +244,27 @@ class Gallery {
       var escapedTitle = self._escapeHtml(title);
       var escapedBody = self._escapeHtml(n.llmBody || '');
       var escapedTime = self._escapeHtml(time);
+      var groupBadge = (n.groupSize && n.groupSize > 1)
+        ? '<span class="gallery-group-badge">' + n.groupSize + ' events</span>'
+        : '';
+      // Name badges: Scrypted (green), LLM (teal), Both (purple) — stacked for multi-person
+      var nameBadge = '';
+      var badgeItems = self._buildNameBadges(n.names, n.llmIdentifiedNames, n.llmIdentifiedName);
+      if (badgeItems.length > 0) {
+        var badgeHtml = badgeItems.map(function(b) {
+          return '<span class="gallery-name-badge gallery-' + b.cssClass + '">' + b.icon + ' ' + self._escapeHtml(b.label) + '</span>';
+        }).join('');
+        nameBadge = badgeItems.length > 1
+          ? '<div class="gallery-name-badges">' + badgeHtml + '</div>'
+          : badgeHtml;
+      }
+      var groupAttr = n.groupId ? ' data-group-id="' + self._escapeHtml(n.groupId) + '"' : '';
+      var groupSizeAttr = (n.groupSize && n.groupSize > 1) ? ' data-group-size="' + n.groupSize + '"' : '';
       html +=
-        '<div class="gallery-card" data-id="' + escapedId + '" data-title="' + escapedTitle + '" data-body="' + escapedBody + '" data-time="' + escapedTime + '">' +
+        '<div class="gallery-card" data-id="' + escapedId + '" data-title="' + escapedTitle + '" data-body="' + escapedBody + '" data-time="' + escapedTime + '"' + groupAttr + groupSizeAttr + '>' +
           '<div class="gallery-card-thumb">' +
             (thumbSrc ? '<img src="' + thumbSrc + '" alt="" loading="lazy" />' : '<div class="gallery-card-no-thumb"></div>') +
+            groupBadge + nameBadge +
           '</div>' +
           '<div class="gallery-card-info">' +
             '<div class="gallery-card-time">' + time + '</div>' +
@@ -252,7 +283,9 @@ class Gallery {
         var t = this.getAttribute('data-title');
         var b = this.getAttribute('data-body');
         var tm = this.getAttribute('data-time');
-        self._onCardClick(id, t, b, tm);
+        var gid = this.getAttribute('data-group-id');
+        var gs = parseInt(this.getAttribute('data-group-size') || '0', 10);
+        self._onCardClick(id, t, b, tm, gid, gs);
       });
     }
 
@@ -327,11 +360,145 @@ class Gallery {
     this.applyFilters(filters);
   }
 
-  _onCardClick(notificationId, title, body, time) {
+  _onCardClick(notificationId, title, body, time, groupId, groupSize) {
+    // If clicking a grouped card (with multiple events) and not already in group view, drill down
+    if (groupId && groupSize > 1 && !this._inGroupView) {
+      console.log(this._logPrefix, 'Drilling into group:', groupId, '(' + groupSize + ' events)');
+      this._drillIntoGroup(groupId);
+      return;
+    }
     console.log(this._logPrefix, 'Card clicked:', notificationId, title);
     if (this._onCardClickFn) {
       this._onCardClickFn(notificationId, title, body, time);
     }
+  }
+
+  async _drillIntoGroup(groupId) {
+    if (this._loading) return;
+    // Save current state for back navigation
+    this._savedState = {
+      notifications: this._notifications,
+      filters: this._filters,
+      activeFilters: this._activeFilters,
+      page: this._page,
+      hasMore: this._hasMore,
+      total: this._total,
+      searchQuery: this._searchQuery,
+      searchMode: this._searchMode,
+      scrollTop: this._containerEl.scrollTop || 0,
+    };
+    this._inGroupView = true;
+
+    this._loading = true;
+    this._showLoading(true);
+    try {
+      var url = this._buildUrl('/brief/gallery/data', { groupId: groupId, pageSize: 100 });
+      console.log(this._logPrefix, 'Fetching group:', groupId, url);
+      var resp = await fetch(url);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      var data = await resp.json();
+      this._notifications = data.notifications;
+      this._total = data.total;
+      this._hasMore = false;
+      this._searchMode = null;
+      this._renderCards(this._notifications);
+      this._renderSearchMode(null);
+      // Show back button
+      this._showBackButton(data.groupTitle || 'Group', data.groupMemberCount || data.total);
+      // Hide filters and search in group view
+      this._setControlsVisible(false);
+    } catch (e) {
+      console.error(this._logPrefix, 'Group fetch error:', e);
+      this._renderEmpty('Failed to load group: ' + e.message);
+    } finally {
+      this._loading = false;
+      this._showLoading(false);
+    }
+  }
+
+  _exitGroupView() {
+    if (!this._savedState) return;
+    this._inGroupView = false;
+
+    // Restore previous state
+    this._notifications = this._savedState.notifications;
+    this._filters = this._savedState.filters;
+    this._activeFilters = this._savedState.activeFilters;
+    this._page = this._savedState.page;
+    this._hasMore = this._savedState.hasMore;
+    this._total = this._savedState.total;
+    this._searchQuery = this._savedState.searchQuery;
+    this._searchMode = this._savedState.searchMode;
+
+    var scrollTop = this._savedState.scrollTop;
+    this._savedState = null;
+
+    // Re-render with saved state
+    this._renderCards(this._notifications);
+    this._renderFilters(this._filters);
+    this._renderSearchMode(this._searchMode);
+    this._hideBackButton();
+    this._setControlsVisible(true);
+
+    // Restore scroll position
+    if (scrollTop) {
+      this._containerEl.scrollTop = scrollTop;
+    }
+  }
+
+  _showBackButton(groupTitle, memberCount) {
+    if (!this._backBtn) {
+      var self = this;
+      this._backBtn = document.createElement('button');
+      this._backBtn.className = 'gallery-back-btn';
+      this._backBtn.addEventListener('click', function() { self._exitGroupView(); });
+      // Insert before the grid
+      var shell = this._gridEl.parentElement;
+      shell.insertBefore(this._backBtn, this._statusEl);
+    }
+    this._backBtn.textContent = '\u2190 Back to Gallery';
+    this._backBtn.style.display = 'block';
+    // Update status with group info
+    if (this._statusEl) {
+      this._statusEl.textContent = groupTitle + ' \u2014 ' + memberCount + ' event' + (memberCount !== 1 ? 's' : '') + ' in group';
+    }
+  }
+
+  _hideBackButton() {
+    if (this._backBtn) {
+      this._backBtn.style.display = 'none';
+    }
+  }
+
+  _setControlsVisible(visible) {
+    var stickyWrap = this._containerEl.querySelector('.gallery-controls-sticky');
+    if (stickyWrap) stickyWrap.style.display = visible ? '' : 'none';
+  }
+
+  _buildNameBadges(names, llmIdentifiedNames, llmIdentifiedName) {
+    var scryptedSet = {};
+    (names || []).forEach(function(n) { scryptedSet[n] = true; });
+    var llmNames = (llmIdentifiedNames && llmIdentifiedNames.length > 0)
+      ? llmIdentifiedNames
+      : (llmIdentifiedName ? [llmIdentifiedName] : []);
+    var llmSet = {};
+    llmNames.forEach(function(n) { llmSet[n] = true; });
+    var allNames = {};
+    Object.keys(scryptedSet).forEach(function(n) { allNames[n] = true; });
+    Object.keys(llmSet).forEach(function(n) { allNames[n] = true; });
+    var badges = [];
+    Object.keys(allNames).forEach(function(name) {
+      var inS = !!scryptedSet[name];
+      var inL = !!llmSet[name];
+      if (inS && inL) {
+        badges.push({ label: name, cssClass: 'name-both', icon: '\uD83D\uDC64\u2728' });
+      } else if (inL) {
+        badges.push({ label: name, cssClass: 'name-llm', icon: '\u2728' });
+      } else {
+        badges.push({ label: name, cssClass: 'name-scrypted', icon: '\uD83D\uDC64' });
+      }
+    });
+    return badges;
   }
 
   _escapeHtml(text) {
@@ -344,6 +511,7 @@ class Gallery {
 // Gallery CSS (injected once when Gallery is used)
 Gallery.CSS = '' +
   '.gallery-shell { padding: 0; }' +
+  '.gallery-controls-sticky { position: sticky; top: 0; z-index: 10; background: var(--bg-primary, #000); padding-top: 12px; }' +
   '.gallery-search-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }' +
   '.gallery-search-input {' +
     'flex: 1; padding: 10px 14px; border-radius: 8px;' +
@@ -354,7 +522,7 @@ Gallery.CSS = '' +
   '.gallery-mode-indicator {' +
     'font-size: 12px; color: var(--text-secondary, #888); white-space: nowrap; display: none;' +
   '}' +
-  '.gallery-filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }' +
+  '.gallery-filter-bar { display: flex; gap: 8px; margin-bottom: 0; flex-wrap: wrap; padding-bottom: 12px; }' +
   '.gallery-filter {' +
     'padding: 6px 10px; border-radius: 6px;' +
     'border: 1px solid var(--bg-secondary, #333); background: var(--bg-secondary, #1a1a2e);' +
@@ -370,9 +538,26 @@ Gallery.CSS = '' +
     'background: var(--bg-secondary, #1a1a2e); transition: transform 0.15s, box-shadow 0.15s;' +
   '}' +
   '.gallery-card:hover { transform: scale(1.03); box-shadow: 0 4px 16px rgba(0,0,0,0.3); }' +
-  '.gallery-card-thumb { width: 100%; aspect-ratio: 16/9; overflow: hidden; background: #111; }' +
+  '.gallery-card-thumb { width: 100%; aspect-ratio: 16/9; overflow: hidden; background: #111; position: relative; }' +
   '.gallery-card-thumb img { width: 100%; height: 100%; object-fit: cover; }' +
   '.gallery-card-no-thumb { width: 100%; height: 100%; background: #222; }' +
+  '.gallery-group-badge {' +
+    'position: absolute; top: 6px; right: 6px; padding: 2px 8px; border-radius: 10px;' +
+    'background: rgba(108, 99, 255, 0.9); color: #fff; font-size: 11px; font-weight: 600;' +
+    'pointer-events: none; line-height: 1.4;' +
+  '}' +
+  '.gallery-name-badges {' +
+    'position: absolute; bottom: 6px; left: 6px; display: flex; flex-direction: column; gap: 2px; pointer-events: none;' +
+  '}' +
+  '.gallery-name-badges .gallery-name-badge { position: static; }' +
+  '.gallery-name-badge {' +
+    'position: absolute; bottom: 6px; left: 6px; padding: 2px 8px; border-radius: 10px;' +
+    'color: #fff; font-size: 11px; font-weight: 600;' +
+    'pointer-events: none; line-height: 1.4;' +
+  '}' +
+  '.gallery-name-scrypted { background: rgba(76, 175, 80, 0.85); }' +
+  '.gallery-name-llm { background: rgba(0, 188, 212, 0.85); }' +
+  '.gallery-name-both { background: rgba(123, 44, 191, 0.85); }' +
   '.gallery-card-info { padding: 8px; }' +
   '.gallery-card-time { font-size: 11px; color: var(--text-secondary, #888); }' +
   '.gallery-card-title { font-size: 13px; color: var(--text-primary, #e0e0e0); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }' +
@@ -385,4 +570,10 @@ Gallery.CSS = '' +
     'padding: 10px 24px; border-radius: 8px; border: none; cursor: pointer;' +
     'background: var(--accent, #6c63ff); color: #fff; font-size: 14px;' +
   '}' +
-  '.gallery-load-more:hover { opacity: 0.9; }';
+  '.gallery-load-more:hover { opacity: 0.9; }' +
+  '.gallery-back-btn {' +
+    'display: none; padding: 6px 14px; margin-bottom: 12px; border-radius: 6px;' +
+    'border: 1px solid var(--bg-secondary, #333); background: var(--bg-secondary, #1a1a2e);' +
+    'color: var(--text-primary, #e0e0e0); font-size: 13px; cursor: pointer;' +
+  '}' +
+  '.gallery-back-btn:hover { background: var(--accent, #6c63ff); color: #fff; }';

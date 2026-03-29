@@ -21,6 +21,10 @@ export interface StoredNotification {
     };
     embedding?: string;           // base64 float32 from ObjectDetectionResult
     embeddingDimension?: number;  // vector length for compatibility checks
+    groupId?: string;             // Links notifications in the same group (undefined = ungrouped)
+    isGroupPrimary?: boolean;     // True = representative notification for its group (highest clarity)
+    llmIdentifiedName?: string;   // DEPRECATED: singular LLM-identified name (backward compat for pre-deploy notifications)
+    llmIdentifiedNames?: string[]; // Names identified by LLM from reference photos (multi-person)
 }
 
 export interface DailyStats {
@@ -43,6 +47,9 @@ export interface CachedHighlight {
     body: string;           // llmBody
     thumbnail: string;      // image URL (endpoint URL at serve time, base64 in storage)
     index?: number;         // Original index in candidates array (for narrative linking)
+    names?: string[];              // Scrypted face recognition names
+    llmIdentifiedName?: string;    // DEPRECATED: singular LLM-identified name
+    llmIdentifiedNames?: string[]; // LLM-identified person names (multi-person)
 }
 
 export interface NarrativeSegment {

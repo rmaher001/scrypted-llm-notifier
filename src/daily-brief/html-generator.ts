@@ -1,5 +1,6 @@
 import { CachedHighlight, NarrativeSegment } from '../types';
 import { escapeHtml } from '../utils';
+import { buildNameBadges } from '../llm-notifier';
 
 // HA card JS is embedded at build time
 import { HA_CARD_JS } from '../ha-card-embedded';
@@ -23,11 +24,10 @@ export function generateDailyBriefHTML(
     summary: string | null,
     highlights: CachedHighlight[],
     generatedAt: number | null,
-    refreshUrl: string,
     timezone: string = 'America/Los_Angeles',
     overview?: string,
     narrative?: NarrativeSegment[],
-    catchUpUrl?: string
+    pluginVersion?: string,
 ): string {
     // Format generation timestamp for display
     const generatedAtStr = generatedAt
@@ -49,10 +49,22 @@ export function generateDailyBriefHTML(
         const escapedBody = escapeHtml(h.body).replace(/'/g, "\\'");
         const itemClass = compact ? 'event-item timeline-item' : 'event-item';
         const indexAttr = index !== undefined ? ` data-index="${index}"` : '';
+        // Name badges: Scrypted (green), LLM (teal), Both (purple) — stacked for multi-person
+        const badges = buildNameBadges(h.names, h.llmIdentifiedNames, h.llmIdentifiedName);
+        let nameBadge = '';
+        if (badges.length > 0) {
+            const badgeHtml = badges.map(b =>
+                `<span class="name-badge ${b.cssClass}">${b.icon} ${escapeHtml(b.label)}</span>`
+            ).join('');
+            nameBadge = badges.length > 1
+                ? `<div class="name-badges">${badgeHtml}</div>`
+                : badgeHtml;
+        }
         return `
         <div class="${itemClass}"${indexAttr} onclick="openVideoModal('${h.id}', '${escapedTitle}', '${escapedBody}', '${h.time}')">
             <div class="event-thumb">
-                ${h.thumbnail ? `<img src="${h.thumbnail}" alt="">` : '<div class="no-thumb"></div>'}
+                ${h.thumbnail ? `<img src="${h.thumbnail.startsWith('data:') ? h.thumbnail : ''}" alt=""${h.thumbnail === 'poster' ? ` data-poster-id="${escapeHtml(h.id)}"` : ''}>` : '<div class="no-thumb"></div>'}
+                ${nameBadge}
             </div>
             <div class="event-meta">
                 <div class="event-time">${h.date} • ${h.time}</div>
@@ -275,6 +287,10 @@ export function generateDailyBriefHTML(
             margin: 0 auto;
             padding: 0 20px;
             border-bottom: 1px solid var(--bg-secondary);
+            position: sticky;
+            top: 0;
+            z-index: 99;
+            background: var(--bg-primary);
         }
         .tab {
             padding: 10px 20px;
@@ -383,17 +399,33 @@ export function generateDailyBriefHTML(
             border-radius: 6px;
         }
 
+        .name-badges {
+            position: absolute;
+            bottom: 4px;
+            left: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            pointer-events: none;
+        }
+        .name-badges .name-badge {
+            position: static;
+        }
         .name-badge {
             position: absolute;
-            bottom: 6px;
-            left: 6px;
-            background: var(--badge-bg);
-            color: white;
-            font-size: 11px;
+            bottom: 4px;
+            left: 4px;
+            padding: 1px 6px;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 10px;
             font-weight: 600;
-            padding: 2px 8px;
-            border-radius: 4px;
+            pointer-events: none;
+            line-height: 1.4;
         }
+        .name-scrypted { background: rgba(76, 175, 80, 0.85); }
+        .name-llm { background: rgba(0, 188, 212, 0.85); }
+        .name-both { background: rgba(123, 44, 191, 0.85); }
 
         .event-meta {
             padding: 8px 4px 12px;
@@ -656,7 +688,7 @@ export function generateDailyBriefHTML(
         <div class="header-left">
             <div>
                 <div class="header-title">DAILY BRIEF</div>
-                <div class="header-date">${generatedAtStr}</div>
+                <div class="header-date">${generatedAtStr}${pluginVersion ? ` · v${pluginVersion}` : ''}</div>
             </div>
         </div>
         <div class="header-actions">
@@ -688,7 +720,7 @@ export function generateDailyBriefHTML(
         <div class="summary-text">${escapeHtml(overview)}</div>
     </div>
     ` : ''}
-    ${catchUpUrl ? `<div class="catchup-bar"><button class="catchup-btn" data-catchup-url="${escapeHtml(catchUpUrl)}" onclick="catchMeUp()">Catch Me Up</button></div>` : ''}
+    <div class="catchup-bar"><button class="catchup-btn" onclick="catchMeUp()">Catch Me Up</button></div>
     <div class="timeline-section">
         ${timelineHTML}
     </div>
@@ -767,25 +799,19 @@ export function generateDailyBriefHTML(
             const current = document.documentElement.getAttribute('data-theme') || 'dark';
             setTheme(current === 'dark' ? 'light' : 'dark');
         }
+        // Base URL for API calls (derived at runtime from current page URL)
+        var baseUrl = window.location.pathname.replace(/\\/brief.*/, '');
+
         function catchMeUp() {
             var btn = event.target.closest('.catchup-btn');
             if (!btn) return;
             btn.classList.add('loading');
             btn.textContent = 'Updating';
-            var catchUpUrl = btn.getAttribute('data-catchup-url');
-            if (catchUpUrl) {
-                window.location.href = catchUpUrl;
-            } else {
-                btn.classList.remove('loading');
-                btn.textContent = 'Catch Me Up';
-            }
+            window.location.href = baseUrl + '/brief?mode=incremental';
         }
         function refreshSummary() {
-            window.location.href = '${refreshUrl}';
+            window.location.href = baseUrl + '/brief?refresh=true';
         }
-
-        // Base URL for API calls (derived from refreshUrl)
-        var baseUrl = '${refreshUrl.split('?')[0].replace(/\/brief.*/, '')}';
 
         // Shared URL builder (used by VideoPlayer and Gallery)
         function buildUrl(path, params) {
@@ -793,6 +819,12 @@ export function generateDailyBriefHTML(
             var qs = new URLSearchParams(params || {});
             return qs.toString() ? url + '?' + qs.toString() : url;
         }
+
+        // Resolve poster thumbnail URLs at runtime using baseUrl
+        document.querySelectorAll('img[data-poster-id]').forEach(function(img) {
+            var id = img.getAttribute('data-poster-id');
+            if (id) img.src = buildUrl('/brief/snapshot', { id: id });
+        });
 
         // Shared VideoPlayer instance
         var player = new VideoPlayer({
@@ -823,6 +855,16 @@ export function generateDailyBriefHTML(
             currentTime = time;
 
             modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+            // Pre-position as absolute before postMessage round-trip (prevents flash)
+            if (window.parent !== window) {
+                var scrollTop = window.scrollY || document.documentElement.scrollTop;
+                modal.style.position = 'absolute';
+                modal.style.top = scrollTop + 'px';
+                modal.style.height = window.innerHeight + 'px';
+                modal.style.bottom = 'auto';
+            }
+            notifyParentModal('open');
             await player.openVideo(notificationId);
         }
 
@@ -833,8 +875,38 @@ export function generateDailyBriefHTML(
         function closeModal(event) {
             if (event && event.target !== event.currentTarget) return;
             player.close();
-            document.getElementById('videoModal').classList.remove('active');
+            var modal = document.getElementById('videoModal');
+            modal.classList.remove('active');
+            modal.style.position = '';
+            modal.style.top = '';
+            modal.style.height = '';
+            modal.style.bottom = '';
+            document.body.style.overflow = '';
+            notifyParentModal('close');
         }
+
+        // Notify parent iframe to lock/unlock height for modal
+        function notifyParentModal(state) {
+            if (window.parent === window) return;
+            window.parent.postMessage({ type: 'daily-brief-modal', state: state }, '*');
+        }
+
+        // Listen for viewport geometry from parent (iframe modal positioning)
+        var _parentOrigin = null;
+        window.addEventListener('message', function(evt) {
+            if (evt.data && evt.data.type === 'daily-brief-viewport') {
+                // Validate origin: only accept from known parent (first sender wins)
+                if (!_parentOrigin) _parentOrigin = evt.origin;
+                if (evt.origin !== _parentOrigin) return;
+                var modal = document.getElementById('videoModal');
+                var scrollTop = window.scrollY || document.documentElement.scrollTop;
+                var visibleTop = Math.max(0, scrollTop - evt.data.iframeTop);
+                modal.style.position = 'absolute';
+                modal.style.top = visibleTop + 'px';
+                modal.style.height = evt.data.viewportHeight + 'px';
+                modal.style.bottom = 'auto';
+            }
+        });
 
         // Close on Escape key
         document.addEventListener('keydown', function(e) {
@@ -892,6 +964,15 @@ export function generateDailyBriefHTML(
         }
         setTheme(getPreferredTheme());
         applySortOrder(getSortOrder());
+
+        // Sticky offsets: measure actual header height, set tab bar top
+        (function() {
+            var header = document.querySelector('.header');
+            var tabBar = document.querySelector('.tab-bar');
+            if (header && tabBar) {
+                tabBar.style.top = header.offsetHeight + 'px';
+            }
+        })();
 
         // ---- Gallery tab integration ----
         var galleryInitialized = false;

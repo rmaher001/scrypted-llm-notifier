@@ -1,16 +1,16 @@
 {
   "name": "@rmaher001/scrypted-llm-notifier",
-  "version": "0.3.12",
+  "version": "0.3.43",
   "description": "Enhance notifications with LLM-generated descriptions of detection images",
   "author": "rmaher001",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rmaher001/llm-notifier.git"
+    "url": "https://github.com/rmaher001/scrypted-llm-notifier.git"
   },
   "bugs": {
-    "url": "https://github.com/rmaher001/llm-notifier/issues"
+    "url": "https://github.com/rmaher001/scrypted-llm-notifier/issues"
   },
-  "homepage": "https://github.com/rmaher001/llm-notifier#readme",
+  "homepage": "https://github.com/rmaher001/scrypted-llm-notifier#readme",
   "license": "MIT",
   "main": "dist/main.nodejs.js",
   "files": [
@@ -33,7 +33,6 @@
     "scrypted-deploy": "scrypted-deploy",
     "scrypted-changelog": "scrypted-changelog",
     "scrypted-package-json": "scrypted-package-json",
-    "prepublishOnly": "npm run build",
     "test": "jest"
   },
   "keywords": [

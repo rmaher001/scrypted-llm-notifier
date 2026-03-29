@@ -41,7 +41,10 @@ export function buildCachedHighlights(
             thumbnail: (n.hasPoster || n.thumbnailB64)
                 ? (n.thumbnailB64 ? `data:image/jpeg;base64,${n.thumbnailB64}` : 'poster')
                 : '',
-            index: indexMap.get(id)  // Store the original index for narrative linking
+            index: indexMap.get(id),  // Store the original index for narrative linking
+            names: n.names?.length > 0 ? n.names : undefined,
+            llmIdentifiedName: n.llmIdentifiedName,
+            llmIdentifiedNames: n.llmIdentifiedNames?.length ? n.llmIdentifiedNames : undefined,
         };
 
         highlights.push(highlight);
