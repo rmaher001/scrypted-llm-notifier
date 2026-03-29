@@ -12,10 +12,10 @@
   },
   "homepage": "https://github.com/rmaher001/scrypted-llm-notifier#readme",
   "license": "MIT",
-  "main": "dist/main.nodejs.js",
+  "main": "out/main.nodejs.js",
   "files": [
-    "dist/main.nodejs.js",
-    "dist/plugin.zip",
+    "out/main.nodejs.js",
+    "out/plugin.zip",
     "ha-card/daily-brief-card.js",
     "ha-card/video-player.js",
     "README.md",
