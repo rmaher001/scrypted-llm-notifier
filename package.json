@@ -1,6 +1,6 @@
 {
   "name": "@rmaher001/scrypted-llm-notifier",
-  "version": "0.3.43",
+  "version": "0.3.44",
   "description": "Enhance notifications with LLM-generated descriptions of detection images",
   "author": "rmaher001",
   "repository": {
@@ -12,7 +12,7 @@
   },
   "homepage": "https://github.com/rmaher001/scrypted-llm-notifier#readme",
   "license": "MIT",
-  "main": "out/main.nodejs.js",
+  "main": "dist/main.nodejs.js",
   "files": [
     "out/main.nodejs.js",
     "out/plugin.zip",
