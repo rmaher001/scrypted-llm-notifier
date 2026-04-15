@@ -64,7 +64,7 @@ export class PosterStore {
         }
     }
 
-    async prune(validIds: Set<string>): Promise<number> {
+    async pruneOlderThan(maxAgeDays: number): Promise<number> {
         let dir: string;
         try {
             dir = await this.ensureDir();
@@ -79,21 +79,18 @@ export class PosterStore {
             return 0;
         }
 
-        // Build a set of sanitized valid IDs for matching
-        const validSanitized = new Set<string>();
-        for (const id of validIds) {
-            validSanitized.add(`${this.sanitizeId(id)}.jpg`);
-        }
-
+        const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
         let pruned = 0;
         for (const file of files) {
             if (!file.endsWith('.jpg')) continue;
-            if (!validSanitized.has(file)) {
+            const fp = path.join(dir, file);
+            const stat = await fsp.stat(fp);
+            if (stat.mtimeMs < cutoff) {
                 try {
-                    await fsp.unlink(path.join(dir, file));
+                    await fsp.unlink(fp);
                     pruned++;
-                } catch {
-                    // Skip files that can't be deleted
+                } catch (e: any) {
+                    if (e.code !== 'ENOENT') throw e;
                 }
             }
         }

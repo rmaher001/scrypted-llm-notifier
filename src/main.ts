@@ -81,14 +81,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         super(nativeId);
         this.notificationStore = new NotificationStore(this.storage, () => mediaManager.getFilesPath());
         this.posterStore = new PosterStore(() => mediaManager.getFilesPath());
-        this.notificationStore.initDiskStorage().then(() => {
-            // Prune orphaned poster files AFTER disk storage is ready
-            // (getAllIds is empty before init on subsequent startups)
-            const validIds = this.notificationStore.getAllIds();
-            return this.posterStore.prune(validIds);
-        }).then(n => {
-            if (n > 0) this.console.log(`[Poster] Pruned ${n} orphaned posters`);
-        }).catch(e => this.console.warn('[Daily Brief] Disk storage or poster prune failed:', e));
+        this.notificationStore.initDiskStorage().catch(e =>
+            this.console.warn('[Daily Brief] Disk storage init failed:', e));
         this.personStore = new PersonStore(() => mediaManager.getFilesPath());
         try {
             this.pluginVersion = require('../package.json').version;
@@ -259,16 +253,15 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
         const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
         const retentionDays = isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw;
-        const intervalMs = (retentionDays + 2) * 24 * 60 * 60 * 1000;
+        const pruneAgeDays = retentionDays + 2;
 
         this.pruneIntervalTimer = setInterval(() => {
-            const validIds = this.notificationStore.getAllIds();
-            this.posterStore.prune(validIds).then(n => {
-                if (n > 0) this.console.log(`[Poster] Periodic prune: removed ${n} orphaned posters`);
+            this.posterStore.pruneOlderThan(pruneAgeDays).then(n => {
+                if (n > 0) this.console.log(`[Poster] Periodic prune: removed ${n} posters older than ${pruneAgeDays} days`);
             }).catch(e => this.console.warn('[Poster] Periodic prune failed:', e));
-        }, intervalMs);
+        }, 24 * 60 * 60 * 1000);
 
-        this.console.log(`[Poster] Prune timer set: every ${retentionDays + 2} days`);
+        this.console.log(`[Poster] Prune timer set: daily, deleting posters older than ${pruneAgeDays} days`);
     }
 
     // Generate narrative for a single 6-hour period

@@ -62,31 +62,34 @@ describe('PosterStore', () => {
         });
     });
 
-    describe('prune', () => {
-        test('removes orphaned poster files', async () => {
-            await store.put('keep-1', SAMPLE_JPEG);
-            await store.put('keep-2', SAMPLE_JPEG);
-            await store.put('orphan-1', SAMPLE_JPEG);
-            await store.put('orphan-2', SAMPLE_JPEG);
+    describe('pruneOlderThan', () => {
+        test('deletes files older than specified days', async () => {
+            await store.put('old-1', SAMPLE_JPEG);
+            await store.put('old-2', SAMPLE_JPEG);
+            await store.put('recent', SAMPLE_JPEG);
 
-            const validIds = new Set(['keep-1', 'keep-2']);
-            const pruned = await store.prune(validIds);
+            // Backdate old files to 10 days ago
+            const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+            const postersDir = path.join(tmpDir, 'posters');
+            await fsp.utimes(path.join(postersDir, 'old-1.jpg'), tenDaysAgo, tenDaysAgo);
+            await fsp.utimes(path.join(postersDir, 'old-2.jpg'), tenDaysAgo, tenDaysAgo);
+
+            const pruned = await store.pruneOlderThan(5);
 
             expect(pruned).toBe(2);
-            expect(await store.has('keep-1')).toBe(true);
-            expect(await store.has('keep-2')).toBe(true);
-            expect(await store.has('orphan-1')).toBe(false);
-            expect(await store.has('orphan-2')).toBe(false);
+            expect(await store.has('old-1')).toBe(false);
+            expect(await store.has('old-2')).toBe(false);
+            expect(await store.has('recent')).toBe(true);
         });
 
-        test('returns 0 when nothing to prune', async () => {
-            await store.put('a', SAMPLE_JPEG);
-            const pruned = await store.prune(new Set(['a']));
+        test('returns 0 when no files are old enough', async () => {
+            await store.put('fresh', SAMPLE_JPEG);
+            const pruned = await store.pruneOlderThan(5);
             expect(pruned).toBe(0);
         });
 
         test('handles empty directory gracefully', async () => {
-            const pruned = await store.prune(new Set());
+            const pruned = await store.pruneOlderThan(5);
             expect(pruned).toBe(0);
         });
     });
