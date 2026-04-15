@@ -21,11 +21,13 @@ const { StorageSettings } = require('@scrypted/sdk/storage-settings');
 const { mediaManager, endpointManager } = sdk;
 import { LRUCache } from 'lru-cache';
 import { WebRTCSignalingSession } from './webrtc';
-import { withTimeout, resizeJpegNearest, getJpegDimensions } from './utils';
+import { withTimeout, resizeJpegNearest, getJpegDimensions, stripJsonFences } from './utils';
 
 import {
     StoredNotification,
     NarrativeSegment,
+    NaturalPeriod,
+    CachedHighlight,
     DailyBriefData,
     FrozenSegment,
     CandidateWithPriority
@@ -33,17 +35,26 @@ import {
 import { NotificationStore } from './notification-store';
 import { buildCachedHighlights } from './daily-brief/highlights';
 import { createTimeBuckets, isVehicleNotification, selectCandidatesFromBuckets } from './daily-brief/candidate-selection';
-import { getNaturalPeriods, matchSegmentToPeriod, buildFrozenContext, createSummaryPrompt } from './daily-brief/prompts';
+import { getNaturalPeriods, buildFrozenContext, createSummaryPrompt } from './daily-brief/prompts';
 import { generateDailyBriefHTML, getHACardBundle } from './daily-brief/html-generator';
 import { LLMNotifier } from './llm-notifier';
 import { PosterStore } from './poster-store';
 import { PersonStore } from './person-store';
 import { NotificationBuffer, BufferedNotification, DeliveryTarget } from './notification-buffer';
 import { groupNotifications, NotificationGroup } from './notification-grouper';
-import { handleGalleryDataRequest, handleGallerySearchRequest, handleThumbnailRequest, handlePeopleRequest, handlePeoplePhotoRequest } from './gallery';
+import { handleGalleryDataRequest, handleGallerySearchRequest, handlePeopleRequest, handlePeoplePhotoRequest, handlePeopleDeleteRequest } from './gallery';
+
+export function resolveNotificationProvider<T>(
+    notificationLlm: T | undefined,
+    selectProvider: () => T,
+): T {
+    if (notificationLlm) return notificationLlm;
+    return selectProvider();
+}
 
 export default class LLMNotifierProvider extends ScryptedDeviceBase implements MixinProvider, Settings, HttpRequestHandler {
     private currentProviderIndex = 0;
+    private currentNotificationProviderIndex = 0;
     private summaryScheduleTimeout: NodeJS.Timeout | undefined;
     private dailyBriefStartupTimer: NodeJS.Timeout | undefined;
     private dailyBriefIntervalTimer: NodeJS.Timeout | undefined;
@@ -56,7 +67,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         max: 1000,
         ttl: 1000 * 60 * 5, // 5 minutes
     });
-    inFlightRequests = new Map<string, Promise<{title: string, subtitle: string, body: string, detailedDescription: string, clarity?: {score: number, reason: string}}>>();
+    inFlightRequests = new LRUCache<string, Promise<{title: string, subtitle: string, body: string, detailedDescription: string, clarity?: {score: number, reason: string}}>>({
+        max: 100,
+    });
     posterStore: PosterStore;
     personStore: PersonStore;
     notificationStore: NotificationStore;
@@ -66,8 +79,16 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
     constructor(nativeId?: string) {
         super(nativeId);
-        this.notificationStore = new NotificationStore(this.storage);
+        this.notificationStore = new NotificationStore(this.storage, () => mediaManager.getFilesPath());
         this.posterStore = new PosterStore(() => mediaManager.getFilesPath());
+        this.notificationStore.initDiskStorage().then(() => {
+            // Prune orphaned poster files AFTER disk storage is ready
+            // (getAllIds is empty before init on subsequent startups)
+            const validIds = this.notificationStore.getAllIds();
+            return this.posterStore.prune(validIds);
+        }).then(n => {
+            if (n > 0) this.console.log(`[Poster] Pruned ${n} orphaned posters`);
+        }).catch(e => this.console.warn('[Daily Brief] Disk storage or poster prune failed:', e));
         this.personStore = new PersonStore(() => mediaManager.getFilesPath());
         try {
             this.pluginVersion = require('../package.json').version;
@@ -78,12 +99,6 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         // Wire configurable retention (storageSettings not available in constructor)
         const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
         this.notificationStore.setRetentionDays(isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw);
-
-        // Prune orphaned poster files (fire-and-forget)
-        const validIds = this.notificationStore.getAllIds();
-        this.posterStore.prune(validIds).then(n => {
-            if (n > 0) this.console.log(`[Poster] Pruned ${n} orphaned posters`);
-        }).catch(e => this.console.warn('[Poster] Prune failed:', e));
 
         // Cache endpoint URLs and log on startup (fire-and-forget)
         this.refreshEndpointCache();
@@ -256,6 +271,112 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         this.console.log(`[Poster] Prune timer set: every ${retentionDays + 2} days`);
     }
 
+    // Generate narrative for a single 6-hour period
+    private async generateForPeriod(
+        period: NaturalPeriod,
+        notifications: StoredNotification[],
+        dateStr: string,
+        timezone: string,
+        isCompleted: boolean,
+        customInstructions?: string,
+        frozenContext?: string,
+    ): Promise<{ narrative: NarrativeSegment[]; highlights: CachedHighlight[]; frozen?: FrozenSegment } | null> {
+        // Filter notifications to this period
+        const periodNotifications = notifications.filter(
+            n => n.timestamp >= period.start && n.timestamp < period.end
+        );
+
+        if (periodNotifications.length === 0) {
+            // Empty completed period — freeze with empty narrative
+            if (isCompleted) {
+                return {
+                    narrative: [],
+                    highlights: [],
+                    frozen: {
+                        periodKey: period.key,
+                        periodStart: period.start,
+                        periodEnd: period.end,
+                        narrative: { timeRange: period.label, text: '', highlightIds: [] },
+                        highlights: [],
+                        highlightNotificationIds: [],
+                    },
+                };
+            }
+            return null;
+        }
+
+        // Bucket + select candidates for this period
+        const buckets = createTimeBuckets(periodNotifications, period.start, period.end, 12, timezone);
+        const candidates = selectCandidatesFromBuckets(buckets, 8);
+
+        if (candidates.length === 0) {
+            if (isCompleted) {
+                return {
+                    narrative: [],
+                    highlights: [],
+                    frozen: {
+                        periodKey: period.key,
+                        periodStart: period.start,
+                        periodEnd: period.end,
+                        narrative: { timeRange: period.label, text: '', highlightIds: [] },
+                        highlights: [],
+                        highlightNotificationIds: [],
+                    },
+                };
+            }
+            return null;
+        }
+
+        this.console.log(`[Daily Brief] Period ${period.label}: ${candidates.length} candidates from ${periodNotifications.length} events`);
+
+        // Generate narrative for this period
+        const { overview, narrative, highlightIds } = await this.generateDailySummary(
+            candidates, dateStr, timezone, customInstructions, frozenContext, period.label
+        );
+
+        // Build highlights
+        const highlights = buildCachedHighlights(candidates, highlightIds, timezone);
+
+        // Override timeRange with the pre-computed period label (don't trust LLM's guess)
+        // Convert narrative highlightIds from candidate indices to notification IDs for merge re-indexing
+        const periodNarrative: NarrativeSegment[] = (narrative || []).map(seg => ({
+            ...seg,
+            timeRange: period.label,
+            highlightIds: (seg.highlightIds || [])
+                .filter(idx => idx >= 0 && idx < candidates.length)
+                .map(idx => candidates[idx].notification.id) as any[],
+        }));
+
+        // Consolidate multi-segment responses into a single narrative segment per period
+        let consolidatedNarrative: NarrativeSegment;
+        if (periodNarrative.length > 1) {
+            this.console.log(`[Daily Brief] Period ${period.label}: LLM returned ${periodNarrative.length} segments, consolidating`);
+            consolidatedNarrative = {
+                timeRange: period.label,
+                text: periodNarrative.map(s => s.text).join(' '),
+                highlightIds: [...new Set(periodNarrative.flatMap(s => s.highlightIds))],
+            };
+        } else {
+            consolidatedNarrative = periodNarrative[0];
+        }
+
+        // Freeze if period is completed
+        let frozen: FrozenSegment | undefined;
+        if (isCompleted) {
+            frozen = {
+                periodKey: period.key,
+                periodStart: period.start,
+                periodEnd: period.end,
+                narrative: consolidatedNarrative,
+                highlights,
+                // Derive from the consolidated narrative to stay in sync
+                highlightNotificationIds: consolidatedNarrative.highlightIds as unknown as string[],
+            };
+        }
+
+        return { narrative: [consolidatedNarrative], highlights, frozen };
+    }
+
     // Generate Daily Brief summary in background (no notification)
     private async generateDailyBriefInBackground(forceFullRegeneration: boolean = false) {
         try {
@@ -345,12 +466,12 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
             this.console.log(`[Daily Brief] Incremental: ${existingFrozen.length} frozen, ${periodsToGenerate.length} to generate (force=${forceFullRegeneration})`);
 
-            // 4. Filter notifications to only those in periods to generate
-            const periodsToGenerateNotifications = notifications.filter(n => {
-                return periodsToGenerate.some(p => n.timestamp >= p.start && n.timestamp < p.end);
-            });
+            // 4. Early exit if no notifications fall in any period to generate
+            const hasNotificationsInPeriods = notifications.some(n =>
+                periodsToGenerate.some(p => n.timestamp >= p.start && n.timestamp < p.end)
+            );
 
-            if (periodsToGenerateNotifications.length === 0 && existingFrozen.length > 0) {
+            if (!hasNotificationsInPeriods && existingFrozen.length > 0) {
                 this.console.log(`[Daily Brief] No new notifications in active periods, keeping frozen segments`);
                 // Re-store with existing data (updates generatedAt)
                 const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
@@ -365,95 +486,54 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 return;
             }
 
-            // 5. Bucket + select candidates for only the periods to generate
-            const buckets = createTimeBuckets(periodsToGenerateNotifications, windowStart, windowEnd, 12, timezone);
-            const candidates = selectCandidatesFromBuckets(buckets, 8);
-
-            const bucketSummary = buckets.map(b => `${b.label}: ${b.notifications.length}`).join(', ');
-            this.console.log(`[Daily Brief] Buckets: ${bucketSummary}`);
-            this.console.log(`[Daily Brief] Selected ${candidates.length} candidates from ${periodsToGenerateNotifications.length} events (${notifications.length} total)`);
-
-            // Guard: if no candidates were selected, skip LLM call
-            if (candidates.length === 0) {
-                this.console.log(`[Daily Brief] No candidates after bucketing, skipping LLM call`);
-                if (existingFrozen.length > 0) {
-                    // Re-store frozen segments only (updates generatedAt)
-                    const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
-                    const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(fs => fs.narrative);
-                    frozenHighlights.forEach((h, i) => { h.index = i; });
-                    const fallbackOverview = frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
-                    this.notificationStore.setCachedSummary(
-                        now, fallbackOverview, notifications.length, frozenHighlights,
-                        windowStart, windowEnd, timezone, fallbackOverview, frozenNarrative, existingFrozen
-                    );
-                }
-                return;
-            }
-
-            // 6. Build frozen context for the LLM prompt
+            // 5. Read custom instructions + build frozen context
+            const customInstructions = this.storage.getItem('dailyBriefCustomPrompt') || '';
             const frozenContext = existingFrozen.length > 0 ? buildFrozenContext(existingFrozen) : undefined;
             if (frozenContext) {
                 this.console.log(`[Daily Brief] Providing ${existingFrozen.length} frozen segments as context to LLM`);
             }
 
-            // 7. Read custom instructions from settings
-            const customInstructions = this.storage.getItem('dailyBriefCustomPrompt') || '';
-
-            // 8. Generate summary for new candidates (with frozen context)
-            const { summary, overview, narrative, highlightIds } = await this.generateDailySummary(
-                candidates, dateStr, timezone, customInstructions || undefined, frozenContext
-            );
-
-            // 9. Build highlights for the new segments
-            const newHighlights = buildCachedHighlights(candidates, highlightIds, timezone);
-
-            // 10. Freeze any newly-completed segments
+            // 6. Generate per-period: one LLM call per period
+            // Accumulate frozenContext so each period's LLM prompt includes prior periods from this run
+            const completedKeys = new Set(completedPeriods.map(p => p.key));
+            const allNewNarrative: NarrativeSegment[] = [];
+            const allNewHighlights: CachedHighlight[] = [];
             const newFrozen: FrozenSegment[] = [...existingFrozen];
-            if (narrative) {
-                for (const segment of narrative) {
-                    const matchedPeriod = matchSegmentToPeriod(segment, completedPeriods, candidates);
-                    if (matchedPeriod && !frozenKeys.has(matchedPeriod.key)) {
-                        // Resolve this segment's highlights to notification IDs (stable across runs)
-                        const segmentNotifIds = (segment.highlightIds || [])
-                            .filter(idx => idx >= 0 && idx < candidates.length)
-                            .map(idx => candidates[idx].notification.id);
-                        const segmentHighlights = buildCachedHighlights(candidates, segmentNotifIds, timezone);
+            let accumulatedFrozenContext = frozenContext;
 
-                        newFrozen.push({
-                            periodKey: matchedPeriod.key,
-                            periodStart: matchedPeriod.start,
-                            periodEnd: matchedPeriod.end,
-                            narrative: segment,
-                            highlights: segmentHighlights,
-                            highlightNotificationIds: segmentNotifIds,
-                        });
-                        frozenKeys.add(matchedPeriod.key);
+            for (const period of periodsToGenerate) {
+                const isCompleted = completedKeys.has(period.key);
+                const result = await this.generateForPeriod(
+                    period, notifications,
+                    dateStr, timezone, isCompleted,
+                    customInstructions || undefined, accumulatedFrozenContext
+                );
+                if (result) {
+                    allNewNarrative.push(...result.narrative);
+                    allNewHighlights.push(...result.highlights);
+                    if (result.frozen) {
+                        newFrozen.push(result.frozen);
+                        frozenKeys.add(result.frozen.periodKey);
+                    }
+                    // Accumulate context for subsequent periods (same format as buildFrozenContext)
+                    if (result.narrative.length > 0) {
+                        const newContext = result.narrative
+                            .filter(n => n.text)
+                            .map(n => `${n.timeRange}: ${n.text} (${(n.highlightIds || []).length} highlights)`)
+                            .join('\n');
+                        accumulatedFrozenContext = accumulatedFrozenContext
+                            ? `${accumulatedFrozenContext}\n${newContext}`
+                            : newContext;
                     }
                 }
             }
 
-            // 10b. Freeze empty completed periods (no events = no segments matched)
-            for (const period of completedPeriods) {
-                if (!frozenKeys.has(period.key)) {
-                    newFrozen.push({
-                        periodKey: period.key,
-                        periodStart: period.start,
-                        periodEnd: period.end,
-                        narrative: { timeRange: period.label, text: '', highlightIds: [] },
-                        highlights: [],
-                        highlightNotificationIds: [],
-                    });
-                    frozenKeys.add(period.key);
-                }
-            }
-
-            // 11. Merge: frozen segments + active (non-frozen) segments
-            // Clone frozen narratives to avoid mutating originals during re-indexing
+            // 7. Merge: frozen segments + new segments
             this.console.log(`[Daily Brief] Reusing frozen periods: ${existingFrozen.map(fs => fs.periodKey).join(', ') || 'none'}`);
-            const narrativeToFrozen = new Map<NarrativeSegment, FrozenSegment>();
             const frozenNarrative: NarrativeSegment[] = [];
+            const narrativeToFrozen = new Map<NarrativeSegment, FrozenSegment>();
             for (const fs of existingFrozen) {
-                if (!fs.narrative.text) continue;  // Skip empty frozen periods (no events)
+                if (!fs.narrative.text) continue;
                 const cloned: NarrativeSegment = {
                     timeRange: fs.narrative.timeRange,
                     text: fs.narrative.text,
@@ -462,48 +542,29 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 frozenNarrative.push(cloned);
                 narrativeToFrozen.set(cloned, fs);
             }
-            const activeNarrative = narrative?.filter(seg => {
-                const matched = matchSegmentToPeriod(seg, completedPeriods, candidates);
-                // Keep segments that are NOT in a newly-frozen completed period
-                // (they're already in frozenNarrative from existingFrozen) OR are active
-                return !matched || !existingFrozen.some(fs => fs.periodKey === matched.key);
-            }) || [];
-            const mergedNarrative = [...frozenNarrative, ...activeNarrative];
-
-            if (activeNarrative.length === 0 && narrative && narrative.length > 0) {
-                this.console.log(`[Daily Brief] All ${narrative.length} new segments matched frozen periods, no active segments added`);
-            }
+            const mergedNarrative = [...frozenNarrative, ...allNewNarrative.filter(seg => seg.text)];
 
             // Merge highlights: frozen + new, re-index contiguously
             const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
-            const mergedHighlights = [...frozenHighlights, ...newHighlights];
+            const mergedHighlights = [...frozenHighlights, ...allNewHighlights];
             mergedHighlights.forEach((h, i) => { h.index = i; });
 
-            // Re-index highlight IDs in merged narrative segments to match new contiguous indices
+            // Re-index highlight IDs in narrative segments
             const highlightIdMap = new Map(mergedHighlights.map((h, i) => [h.id, i]));
             for (const seg of mergedNarrative) {
                 const frozenSeg = narrativeToFrozen.get(seg);
                 if (frozenSeg) {
-                    // Frozen segments: use stored notification IDs (stable across runs)
                     seg.highlightIds = frozenSeg.highlightNotificationIds
                         .map(notifId => highlightIdMap.get(notifId) ?? -1)
                         .filter(idx => idx >= 0);
                 } else {
-                    // New segments: highlightIds are candidate array indices
                     seg.highlightIds = seg.highlightIds
-                        .map(oldIdx => {
-                            if (oldIdx >= 0 && oldIdx < candidates.length) {
-                                const notifId = candidates[oldIdx]?.notification?.id;
-                                if (!notifId) return -1;
-                                return highlightIdMap.get(notifId) ?? -1;
-                            }
-                            return -1;
-                        })
+                        .map(id => highlightIdMap.get(id as any) ?? -1)
                         .filter(idx => idx >= 0);
                 }
             }
 
-            // Sort merged narrative chronologically by period start time
+            // Sort chronologically — frozen segments by periodStart, new by first highlight timestamp
             mergedNarrative.sort((a, b) => {
                 const aFrozen = narrativeToFrozen.get(a);
                 const bFrozen = narrativeToFrozen.get(b);
@@ -512,8 +573,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 return aTime - bTime;
             });
 
-            // 12. Build final summary
-            const mergedOverview = overview || summary;
+            // 8. Build final summary
+            const mergedOverview = allNewNarrative.map(s => s.text).join(' ').slice(0, 200)
+                || frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
 
             this.notificationStore.setCachedSummary(
                 now, mergedOverview, notifications.length, mergedHighlights,
@@ -580,7 +642,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         }
     }
 
-    async generateDailySummary(candidates: CandidateWithPriority[], dateStr: string, timezone: string, customInstructions?: string, frozenContext?: string): Promise<{ summary: string; overview?: string; narrative?: NarrativeSegment[]; highlightIds: string[] }> {
+    async generateDailySummary(candidates: CandidateWithPriority[], dateStr: string, timezone: string, customInstructions?: string, frozenContext?: string, periodLabel?: string): Promise<{ summary: string; overview?: string; narrative?: NarrativeSegment[]; highlightIds: string[] }> {
         this.console.log(`[Daily Brief] Starting summary generation for ${candidates.length} candidates`);
 
         const device = this.selectProvider();
@@ -598,7 +660,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             this.console.log(`[Daily Brief] Limiting to ${MAX_CANDIDATES} of ${candidates.length} candidates`);
         }
 
-        const prompt = createSummaryPrompt(limitedCandidates, dateStr, timezone, customInstructions, frozenContext);
+        const prompt = createSummaryPrompt(limitedCandidates, dateStr, timezone, customInstructions, frozenContext, periodLabel);
         const promptSize = JSON.stringify(prompt).length;
         const timeoutMs = Math.max(1, Number((this.storageSettings.values as any).llmTimeoutMs ?? 90)) * 1000;
 
@@ -628,12 +690,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
             // Parse JSON response (strip markdown code blocks if present)
             try {
-                let jsonContent = content.trim();
-                // Remove markdown code block wrapper if present
-                if (jsonContent.startsWith('```')) {
-                    jsonContent = jsonContent.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '');
-                }
-                const json = JSON.parse(jsonContent);
+                const json = JSON.parse(stripJsonFences(content));
 
                 // Handle new narrative format with explicit validation (#7)
                 if (!json.overview || typeof json.overview !== 'string') {
@@ -864,7 +921,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     headers: { 'Content-Type': 'application/json' }
                 });
             } catch (e) {
-                response.send(JSON.stringify({ error: String(e) }), {
+                this.console.error('[Test Notification] Error:', e);
+                response.send(JSON.stringify({ error: 'Test notification failed' }), {
                     code: 500,
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -873,16 +931,18 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         }
 
         // Handle timezone auto-detection from browser
-        if (path === '/brief/set-timezone') {
+        if (path === '/brief/set-timezone' && request.method === 'POST') {
             try {
                 const urlObj = new URL(url, 'http://localhost');
                 const tz = urlObj.searchParams.get('tz');
                 if (tz) {
+                    // Validate timezone string
+                    Intl.DateTimeFormat(undefined, { timeZone: tz });
                     this.storage.setItem('dailyBriefTimezone', tz);
                     this.console.log(`Timezone auto-detected: ${tz}`);
                 }
             } catch (e) {
-                // Ignore errors
+                // Invalid timezone or other error — ignore
             }
             response.send('OK', { headers: { 'Content-Type': 'text/plain' } });
             return;
@@ -919,7 +979,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         });
 
         // Clear all data endpoint
-        if (path === '/brief/clear') {
+        if (path === '/brief/clear' && request.method === 'POST') {
             this.notificationStore.clear();
             this.console.log('[Daily Brief] Storage cleared via HTTP endpoint');
             response.send(JSON.stringify({ success: true, message: 'All notifications cleared' }), {
@@ -1002,9 +1062,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 };
 
                 try {
-                    // Request a 30-second clip: 10s before detection, 20s after
-                    const startTime = notification.timestamp - 10000;
-                    const duration = 30000;
+                    // Request a 25-second clip: 5s before detection, 20s after
+                    const startTime = notification.timestamp - 5000;
+                    const duration = 25000;
 
                     this.console.log(`[Video] Calling getRecordingStream: startTime=${new Date(startTime).toISOString()}, duration=${duration}ms`);
 
@@ -1099,7 +1159,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     return;
                 } catch (e: any) {
                     this.console.error(`[Video] Error fetching clip from NVR:`, e);
-                    response.send(JSON.stringify({ error: `Failed to fetch video: ${e?.message || e}` }), {
+                    response.send(JSON.stringify({ error: 'Failed to fetch video' }), {
                         code: 500,
                         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                     });
@@ -1115,10 +1175,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             return;
         }
 
-        // Snapshot endpoint - serves poster-quality image with fallback chain:
+        // Snapshot endpoint - serves poster-quality image:
         // 1. posterStore (disk read, pre-generated at detection time)
-        // 2. thumbnailB64 (low-res crop fallback, better than nothing)
-        // 3. 404 (no image data — client waits for WebRTC)
+        // 2. 404 (no image data)
         if (path === '/brief/snapshot') {
             const urlObj = new URL(url, 'http://localhost');
             const notificationId = urlObj.searchParams.get('id') || '';
@@ -1157,22 +1216,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     return;
                 }
 
-                // 2. Fall back to thumbnailB64 (low-res crop, better than nothing)
-                if (notification.thumbnailB64) {
-                    this.console.log(`[Poster] No disk poster, falling back to thumbnailB64: ${notificationId}`);
-                    const jpegBuffer = Buffer.from(notification.thumbnailB64, 'base64');
-                    response.send(jpegBuffer, {
-                        headers: {
-                            'Content-Type': 'image/jpeg',
-                            'Content-Length': jpegBuffer.length.toString(),
-                            'Access-Control-Allow-Origin': '*',
-                            'Cache-Control': 'public, max-age=3600'
-                        }
-                    });
-                    return;
-                }
-
-                // 3. No image data at all
+                // 2. No image data at all
                 response.send(JSON.stringify({ error: 'No snapshot available' }), {
                     code: 404,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -1180,7 +1224,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 return;
             } catch (e: any) {
                 this.console.error(`[Poster] Error fetching snapshot:`, e);
-                response.send(JSON.stringify({ error: `Failed to fetch snapshot: ${e?.message || e}` }), {
+                response.send(JSON.stringify({ error: 'Failed to fetch snapshot' }), {
                     code: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
@@ -1238,9 +1282,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     return;
                 }
 
-                // Request a 30-second clip: 10s before detection, 20s after
-                const startTime = notification.timestamp - 10000;
-                const duration = 30000;
+                // Request a 25-second clip: 5s before detection, 20s after
+                const startTime = notification.timestamp - 5000;
+                const duration = 25000;
 
                 this.console.log(`[WebRTC] Getting recording stream: startTime=${new Date(startTime).toISOString()}, duration=${duration}ms`);
 
@@ -1295,7 +1339,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
             } catch (e: any) {
                 this.console.error(`[WebRTC] Signaling error:`, e);
-                response.send(JSON.stringify({ error: e?.message || 'WebRTC signaling failed' }), {
+                response.send(JSON.stringify({ error: 'WebRTC signaling failed' }), {
                     code: 500,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                 });
@@ -1335,6 +1379,66 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             return;
         }
 
+        // People delete endpoint (POST only to prevent CSRF)
+        if (path === '/brief/people/delete' && request.method === 'POST') {
+            const result = await handlePeopleDeleteRequest(url, this.personStore);
+            response.send(result.body, {
+                code: result.code,
+                headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
+            });
+            return;
+        }
+
+        // Gallery SSE endpoint — pushes events when new notifications arrive
+        if (path === '/brief/gallery/sse') {
+            const keepaliveMs = 30_000;
+            const console = this.console;
+
+            async function* sseGenerator(store: { onAdd: (fn: () => void) => () => void }) {
+                let pending = false;
+                let wakeResolve: ((r: string) => void) | null = null;
+                const unsub = store.onAdd(() => {
+                    pending = true;
+                    if (wakeResolve) { wakeResolve('notification'); wakeResolve = null; }
+                });
+                let keepaliveResolve: (() => void) | null = null;
+                yield Buffer.from(': connected\n\n');
+                let keepaliveTimer: NodeJS.Timeout | null = null;
+                try {
+                    keepaliveTimer = setInterval(() => { if (keepaliveResolve) keepaliveResolve(); }, keepaliveMs);
+                    while (true) {
+                        const reason = pending
+                            ? 'notification'
+                            : await new Promise<string>(resolve => {
+                                wakeResolve = resolve;
+                                keepaliveResolve = () => { keepaliveResolve = null; resolve('keepalive'); };
+                            });
+                        pending = false;
+                        if (reason === 'notification') {
+                            yield Buffer.from('data: new-notification\n\n');
+                        } else {
+                            yield Buffer.from(': keepalive\n\n');
+                        }
+                    }
+                } finally {
+                    unsub();
+                    if (keepaliveTimer) clearInterval(keepaliveTimer);
+                    console.log('[SSE] Client disconnected');
+                }
+            }
+
+            this.console.log('[SSE] Client connected');
+            response.sendStream(sseGenerator(this.notificationStore), {
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'Access-Control-Allow-Origin': '*',
+                }
+            });
+            return;
+        }
+
         // Gallery data endpoint
         if (path === '/brief/gallery/data') {
             const result = await handleGalleryDataRequest(url, this.notificationStore, request.rootPath || '');
@@ -1362,27 +1466,6 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 code: result.code,
                 headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
             });
-            return;
-        }
-
-        // Thumbnail endpoint
-        if (path === '/brief/thumbnail') {
-            const result = await handleThumbnailRequest(url, this.notificationStore);
-            if (Buffer.isBuffer(result.body)) {
-                response.send(result.body as Buffer, {
-                    code: result.code,
-                    headers: {
-                        'Content-Type': result.contentType,
-                        'Access-Control-Allow-Origin': '*',
-                        'Cache-Control': result.cacheControl || '',
-                    }
-                });
-            } else {
-                response.send(result.body as string, {
-                    code: result.code,
-                    headers: { 'Content-Type': result.contentType, 'Access-Control-Allow-Origin': '*' }
-                });
-            }
             return;
         }
 
@@ -1432,7 +1515,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             );
             this.console.log(`[Daily Brief] Sending HTML (${html.length} bytes)`);
             response.send(html, {
-                headers: { 'Content-Type': 'text/html' }
+                headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' }
             });
             return;
         }
@@ -1445,7 +1528,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             this.console.error(`[Daily Brief] Unhandled error in request handler:`, e);
             // Return JSON for API endpoints, plain text for HTML
             if (path.includes('/video') || path.includes('/api') || path.includes('format=json')) {
-                response.send(JSON.stringify({ error: 'Internal server error: ' + (e as Error).message }), {
+                response.send(JSON.stringify({ error: 'Internal server error' }), {
                     code: 500,
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -1484,6 +1567,16 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         chatCompletions: {
             title: 'LLM Providers',
             description: 'Select multiple LLM providers to distribute load. Install the LLM plugin to add external providers or run local LLM servers.',
+            type: 'device',
+            deviceFilter: `interfaces.includes('ChatCompletion')`,
+            multiple: true,
+            group: 'General',
+        },
+        notificationLlm: {
+            title: 'Notification LLM',
+            description: 'Optional: Use dedicated models for per-detection enrichment (e.g., local LLMs). '
+                + 'Daily Brief, Person ID, and notification grouping always use the main LLM Providers. '
+                + 'If not set, all features use LLM Providers.',
             type: 'device',
             deviceFilter: `interfaces.includes('ChatCompletion')`,
             multiple: true,
@@ -1667,6 +1760,7 @@ See <a href="https://github.com/rmaher001/scrypted-llm-notifier#ha-card-setup" t
         const orderedKeys = [
             // General first
             'chatCompletions',
+            'notificationLlm',
             'promptUpdateInfo',
             'userPrompt',
             // Options (Advanced)
@@ -1880,6 +1974,17 @@ See <a href="https://github.com/rmaher001/scrypted-llm-notifier#ha-card-setup" t
         this.currentProviderIndex = (this.currentProviderIndex + 1) % providerIds.length;
         
         return sdk.systemManager.getDeviceById(providerId) as ScryptedDevice & ChatCompletion;
+    }
+
+    selectNotificationProvider(): ScryptedDevice & ChatCompletion {
+        const providerIds = (this.storageSettings.values as any).notificationLlm as string[] | undefined;
+        if (!providerIds?.length) {
+            return resolveNotificationProvider(undefined, () => this.selectProvider());
+        }
+        const providerId = providerIds[this.currentNotificationProviderIndex % providerIds.length];
+        this.currentNotificationProviderIndex = (this.currentNotificationProviderIndex + 1) % providerIds.length;
+        const device = sdk.systemManager.getDeviceById(providerId) as ScryptedDevice & ChatCompletion;
+        return resolveNotificationProvider(device, () => this.selectProvider());
     }
 
     async canMixin(type: ScryptedDeviceType, interfaces: string[]) {

@@ -29,6 +29,8 @@ export type FlushHandler = (
     targets: DeliveryTarget[],
 ) => Promise<void>;
 
+export const MAX_BUFFERED_NOTIFICATIONS = 100;
+
 export class NotificationBuffer {
     private notifications = new Map<string, BufferedNotification>();
     private targets: DeliveryTarget[] = [];
@@ -40,8 +42,9 @@ export class NotificationBuffer {
     ) {}
 
     add(notification: BufferedNotification, notifier: any, options: any, media: any, icon?: any): void {
-        // Store notification (deduped by id)
+        // Store notification (deduped by id), cap at max to prevent unbounded growth
         if (!this.notifications.has(notification.id)) {
+            if (this.notifications.size >= MAX_BUFFERED_NOTIFICATIONS) return;
             this.notifications.set(notification.id, notification);
         }
 

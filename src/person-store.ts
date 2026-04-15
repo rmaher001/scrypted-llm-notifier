@@ -6,15 +6,18 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 
 export interface PersonReference {
-    name: string;           // Original casing ("Richard")
-    clarityScore: number;   // Clarity score of the stored reference photo
-    updatedAt: number;      // Timestamp when reference was last updated
-    cameraName?: string;    // Which camera captured it
+    name: string;                 // Original casing ("Richard")
+    clarityScore: number;         // General image clarity score (legacy)
+    faceReferenceScore?: number;  // Face-specific reference quality (1-10)
+    updatedAt: number;            // Timestamp when reference was last updated
+    cameraName?: string;          // Which camera captured it
 }
 
 export class PersonStore {
     private getFilesPath: () => Promise<string>;
     private dirReady: Promise<string> | null = null;
+    private cachedRefs: { data: Map<string, string>; expiry: number } | null = null;
+    private locks = new Map<string, Promise<any>>();
 
     constructor(getFilesPath: () => Promise<string>) {
         this.getFilesPath = getFilesPath;
@@ -69,13 +72,32 @@ export class PersonStore {
         await fsp.writeFile(mp, JSON.stringify(refs, null, 2));
     }
 
-    async curate(name: string, jpeg: Buffer, clarityScore: number, cameraName?: string): Promise<boolean> {
+    private withLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+        const key = this.normalizeName(name);
+        const prev = this.locks.get(key) ?? Promise.resolve();
+        const next = prev.then(fn, fn);
+        const sentinel = next.catch(() => {});
+        this.locks.set(key, sentinel);
+        sentinel.finally(() => {
+            if (this.locks.get(key) === sentinel) this.locks.delete(key);
+        });
+        return next;
+    }
+
+    async curate(name: string, jpeg: Buffer, clarityScore: number, cameraName?: string, faceReferenceScore?: number): Promise<boolean> {
+        return this.withLock(name, () => this._curate(name, jpeg, clarityScore, cameraName, faceReferenceScore));
+    }
+
+    private async _curate(name: string, jpeg: Buffer, clarityScore: number, cameraName?: string, faceReferenceScore?: number): Promise<boolean> {
         const normalized = this.normalizeName(name);
         const refs = await this.readMetadata();
         const existing = refs.find(r => this.normalizeName(r.name) === normalized);
 
-        if (existing && clarityScore <= existing.clarityScore) {
-            return false;
+        if (existing) {
+            const newFace = faceReferenceScore ?? clarityScore;
+            const existingFace = existing.faceReferenceScore ?? existing.clarityScore;
+            if (newFace < existingFace) return false;
+            if (newFace === existingFace && clarityScore <= existing.clarityScore) return false;
         }
 
         // Write photo to disk first (must succeed before updating metadata)
@@ -86,6 +108,7 @@ export class PersonStore {
         const newRef: PersonReference = {
             name: existing ? existing.name : name,
             clarityScore,
+            faceReferenceScore,
             updatedAt: Date.now(),
             cameraName,
         };
@@ -98,6 +121,7 @@ export class PersonStore {
         }
 
         await this.writeMetadata(refs);
+        this.invalidateReferenceCache();
         return true;
     }
 
@@ -122,6 +146,10 @@ export class PersonStore {
     }
 
     async getAllReferenceImages(): Promise<Map<string, string>> {
+        if (this.cachedRefs && Date.now() < this.cachedRefs.expiry) {
+            return this.cachedRefs.data;
+        }
+
         const result = new Map<string, string>();
         const refs = await this.readMetadata();
 
@@ -132,10 +160,19 @@ export class PersonStore {
             }
         }
 
+        this.cachedRefs = { data: result, expiry: Date.now() + 30_000 };
         return result;
     }
 
+    private invalidateReferenceCache(): void {
+        this.cachedRefs = null;
+    }
+
     async remove(name: string): Promise<boolean> {
+        return this.withLock(name, () => this._remove(name));
+    }
+
+    private async _remove(name: string): Promise<boolean> {
         const normalized = this.normalizeName(name);
         const refs = await this.readMetadata();
         const idx = refs.findIndex(r => this.normalizeName(r.name) === normalized);
@@ -153,6 +190,7 @@ export class PersonStore {
         // Update metadata
         refs.splice(idx, 1);
         await this.writeMetadata(refs);
+        this.invalidateReferenceCache();
         return true;
     }
 
@@ -185,6 +223,7 @@ export class PersonStore {
 
         const remaining = refs.filter(r => normalizedKnown.has(this.normalizeName(r.name)));
         await this.writeMetadata(remaining);
+        this.invalidateReferenceCache();
         return toRemove.length;
     }
 }

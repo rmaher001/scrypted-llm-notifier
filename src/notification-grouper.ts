@@ -5,6 +5,7 @@
 // ============================================================================
 
 import { BufferedNotification } from './notification-buffer';
+import { stripJsonFences } from './utils';
 
 export interface NotificationGroup {
     notificationIds: string[];
@@ -42,7 +43,7 @@ RULES:
     // Format each notification as a numbered line
     const lines = notifications.map((n, i) => {
         const time = new Date(n.timestamp).toLocaleTimeString('en-US', { hour12: false });
-        return `${i + 1}. [id:${n.id}] ${time} | ${n.cameraName} | "${n.title}" | "${n.detailedDescription || n.body}"`;
+        return `${i + 1}. [id:${n.id}] ${time} | ${n.cameraName} | "${n.title}" | "${n.subtitle}" | "${n.detailedDescription || n.body}"`;
     });
 
     const userContent = `Group these ${notifications.length} notifications from the last window:\n\n${lines.join('\n')}`;
@@ -91,7 +92,7 @@ RULES:
  * Pure function — throws on invalid input.
  */
 export function parseGroupingResponse(content: string): GroupingResult {
-    const json = JSON.parse(content);
+    const json = JSON.parse(stripJsonFences(content));
 
     if (!json.groups || !Array.isArray(json.groups)) {
         throw new Error('Invalid grouping response: missing groups array');

@@ -16,9 +16,12 @@ import {
     filterAcceptedPersons,
     buildNameBadges,
     processFullFrame,
+    buildStoredNotification,
+    extractFaceBoundingBox,
 } from '../src/llm-notifier';
 import { StoredNotification } from '../src/types';
 import { collapseByGroup, getGalleryPage } from '../src/gallery';
+import { cropJpeg, parseFaceReferenceQuality } from '../src/utils';
 import { prioritySelectFromBucket } from '../src/daily-brief/candidate-selection';
 
 describe('extractDetectionId', () => {
@@ -184,6 +187,24 @@ describe('callLlm', () => {
             .rejects.toThrow();
     });
 
+    it('strips markdown json fences from response', async () => {
+        const inner = JSON.stringify({
+            title: 'Fenced Response',
+            subtitle: 'Test',
+            body: 'Body text',
+            detailedDescription: 'Detailed',
+            clarity: { score: 7, reason: 'clear' },
+        });
+        const mockProvider = {
+            getChatCompletion: jest.fn().mockResolvedValue({
+                choices: [{ message: { content: '```json\n' + inner + '\n```' } }],
+            }),
+        };
+
+        const result = await callLlm(mockProvider as any, {} as any, 90000, mockConsole as any);
+        expect(result.title).toBe('Fenced Response');
+    });
+
     it('throws on missing required fields', async () => {
         const mockProvider = {
             getChatCompletion: jest.fn().mockResolvedValue({
@@ -216,6 +237,49 @@ describe('callLlm', () => {
         const result = await callLlm(mockProvider as any, {} as any, 90000, mockConsole as any);
         expect(result.detailedDescription).toBe('');
     });
+
+    it('parses faceReferenceQuality from LLM response', async () => {
+        const mockProvider = {
+            getChatCompletion: jest.fn().mockResolvedValue({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({
+                            title: 'T', subtitle: 'S', body: 'B',
+                            detailedDescription: 'D',
+                            clarity: { score: 8, reason: 'clear' },
+                            faceReferenceQuality: {
+                                score: 9, frontFacing: true, unobstructed: true, singleSubject: true,
+                            },
+                        }),
+                    },
+                }],
+            }),
+        };
+
+        const result = await callLlm(mockProvider as any, {} as any, 90000, mockConsole as any);
+        expect(result.faceReferenceQuality).toEqual({
+            score: 9, frontFacing: true, unobstructed: true, singleSubject: true,
+        });
+    });
+
+    it('sets faceReferenceQuality to null when not in LLM response', async () => {
+        const mockProvider = {
+            getChatCompletion: jest.fn().mockResolvedValue({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({
+                            title: 'T', subtitle: 'S', body: 'B',
+                            detailedDescription: 'D',
+                            clarity: { score: 5, reason: 'ok' },
+                        }),
+                    },
+                }],
+            }),
+        };
+
+        const result = await callLlm(mockProvider as any, {} as any, 90000, mockConsole as any);
+        expect(result.faceReferenceQuality).toBeNull();
+    });
 });
 
 describe('createMessageTemplate with referenceImages', () => {
@@ -227,6 +291,21 @@ describe('createMessageTemplate with referenceImages', () => {
         const schema = result.response_format.json_schema.schema;
         expect(schema.properties.identifiedPerson).toBeUndefined();
         expect(schema.required).not.toContain('identifiedPerson');
+    });
+
+    it('includes faceReferenceQuality in schema', () => {
+        const result = createMessageTemplate('prompt', ['img'], {});
+        const schema = result.response_format.json_schema.schema;
+        expect(schema.properties.faceReferenceQuality).toBeDefined();
+        expect(schema.required).toContain('faceReferenceQuality');
+    });
+
+    it('faceReferenceQuality prompt mentions frontFacing and unobstructed', () => {
+        const result = createMessageTemplate('prompt', ['img'], {});
+        const systemMsg = result.messages[0].content as string;
+        expect(systemMsg).toMatch(/faceReferenceQuality/);
+        expect(systemMsg).toMatch(/front.?facing/i);
+        expect(systemMsg).toMatch(/unobstructed/i);
     });
 
     it('produces unchanged output when referenceImages is undefined', () => {
@@ -258,9 +337,9 @@ describe('createMessageTemplate with referenceImages', () => {
         const result = createMessageTemplate('prompt', ['det-img'], {}, refs);
 
         const userContent = result.messages[1].content as any[];
-        // Should have: metadata text, detection image, "Reference photos" text,
-        // "Known person: Richard", Richard image, "Known person: Olesia", Olesia image
-        expect(userContent).toHaveLength(1 + 1 + 1 + 2 * 2); // 7 items
+        // Should have: "Reference photos" text, "Known person: Richard", Richard image,
+        // "Known person: Olesia", Olesia image, detection image, metadata text
+        expect(userContent).toHaveLength(1 + 2 * 2 + 1 + 1); // 7 items
 
         // Check reference photo labels
         const textItems = userContent.filter((c: any) => c.type === 'text').map((c: any) => c.text);
@@ -271,6 +350,11 @@ describe('createMessageTemplate with referenceImages', () => {
         // Check reference images
         const imageItems = userContent.filter((c: any) => c.type === 'image_url');
         expect(imageItems).toHaveLength(3); // 1 detection + 2 references
+
+        // Detection images must come BEFORE metadata text (images before text for better vision grounding)
+        const detImgIdx = userContent.findIndex((c: any) => c.type === 'image_url' && c.image_url.url === 'det-img');
+        const metadataIdx = userContent.findIndex((c: any) => c.type === 'text' && c.text.includes('metadata'));
+        expect(detImgIdx).toBeLessThan(metadataIdx);
     });
 
     it('includes identifiedPersons array in JSON schema when referenceImages provided', () => {
@@ -625,12 +709,28 @@ describe('shouldLoadReferenceImages', () => {
         expect(shouldLoadReferenceImages(true, detections)).toBe(false);
     });
 
-    it('returns true when person detected + no face label', () => {
+    it('returns false when person detected but no face detected (too far/small)', () => {
         const detections = [{ className: 'person' }];
+        expect(shouldLoadReferenceImages(true, detections)).toBe(false);
+    });
+
+    it('returns true when person + face WITHOUT label and score >= 0.7', () => {
+        const detections = [
+            { className: 'person' },
+            { className: 'face', score: 0.85 },
+        ];
         expect(shouldLoadReferenceImages(true, detections)).toBe(true);
     });
 
-    it('returns true when person + face WITHOUT label (detected but unidentified)', () => {
+    it('returns false when person + face WITHOUT label but score < 0.7', () => {
+        const detections = [
+            { className: 'person' },
+            { className: 'face', score: 0.4 },
+        ];
+        expect(shouldLoadReferenceImages(true, detections)).toBe(false);
+    });
+
+    it('returns true when face has no score field (defaults to eligible)', () => {
         const detections = [
             { className: 'person' },
             { className: 'face' },
@@ -650,11 +750,21 @@ describe('shouldLoadReferenceImages', () => {
         expect(shouldLoadReferenceImages(true, null as any)).toBe(false);
     });
 
-    it('returns true when 2 persons + 1 labeled face (unidentified person remains)', () => {
+    it('returns false when 2 persons + 1 labeled face but no unlabeled face', () => {
         const detections = [
             { className: 'person' },
             { className: 'person' },
             { className: 'face', label: 'Richard' },
+        ];
+        expect(shouldLoadReferenceImages(true, detections)).toBe(false);
+    });
+
+    it('returns true when 2 persons + 1 labeled face + 1 unlabeled face with high score', () => {
+        const detections = [
+            { className: 'person' },
+            { className: 'person' },
+            { className: 'face', label: 'Richard' },
+            { className: 'face', score: 0.9 },
         ];
         expect(shouldLoadReferenceImages(true, detections)).toBe(true);
     });
@@ -667,16 +777,6 @@ describe('shouldLoadReferenceImages', () => {
             { className: 'face', label: 'Olesia' },
         ];
         expect(shouldLoadReferenceImages(true, detections)).toBe(false);
-    });
-
-    it('returns true when 3 persons + 1 labeled face', () => {
-        const detections = [
-            { className: 'person' },
-            { className: 'person' },
-            { className: 'person' },
-            { className: 'face', label: 'Richard' },
-        ];
-        expect(shouldLoadReferenceImages(true, detections)).toBe(true);
     });
 });
 
@@ -715,6 +815,47 @@ describe('shouldCurateReference', () => {
 
     it('returns true when clarity is exactly 5', () => {
         expect(shouldCurateReference(true, ['Richard'], 5, jpegUrl)).toBe(true);
+    });
+
+    // faceReferenceQuality-based gating
+    const goodFaceRef = { score: 8, frontFacing: true, unobstructed: true, singleSubject: true };
+
+    it('returns true when faceRef passes all checks', () => {
+        expect(shouldCurateReference(true, ['Richard'], undefined, jpegUrl, goodFaceRef)).toBe(true);
+    });
+
+    it('rejects when faceRef.frontFacing is false', () => {
+        expect(shouldCurateReference(true, ['Richard'], undefined, jpegUrl,
+            { ...goodFaceRef, frontFacing: false })).toBe(false);
+    });
+
+    it('rejects when faceRef.unobstructed is false', () => {
+        expect(shouldCurateReference(true, ['Richard'], undefined, jpegUrl,
+            { ...goodFaceRef, unobstructed: false })).toBe(false);
+    });
+
+    it('rejects when faceRef.score < 7', () => {
+        expect(shouldCurateReference(true, ['Richard'], undefined, jpegUrl,
+            { ...goodFaceRef, score: 6 })).toBe(false);
+    });
+
+    it('accepts when faceRef.score is exactly 7', () => {
+        expect(shouldCurateReference(true, ['Richard'], undefined, jpegUrl,
+            { ...goodFaceRef, score: 7 })).toBe(true);
+    });
+
+    it('accepts when singleSubject is false (soft signal)', () => {
+        expect(shouldCurateReference(true, ['Richard'], undefined, jpegUrl,
+            { ...goodFaceRef, singleSubject: false })).toBe(true);
+    });
+
+    it('falls back to clarity when faceRef is null', () => {
+        expect(shouldCurateReference(true, ['Richard'], 7, jpegUrl, null)).toBe(true);
+        expect(shouldCurateReference(true, ['Richard'], 4, jpegUrl, null)).toBe(false);
+    });
+
+    it('falls back to clarity when faceRef is undefined', () => {
+        expect(shouldCurateReference(true, ['Richard'], 7, jpegUrl, undefined)).toBe(true);
     });
 });
 
@@ -1099,5 +1240,233 @@ describe('processFullFrame', () => {
     test('throws on invalid buffer (no retry with broken data)', async () => {
         const broken = Buffer.from([0x00, 0x01, 0x02]);
         await expect(processFullFrame(broken, mockConsole)).rejects.toThrow();
+    });
+});
+
+describe('buildStoredNotification', () => {
+    it('uses detectionEpoch as timestamp, not current time', () => {
+        const detectionEpoch = Date.now() - 15000; // 15 seconds ago (simulates LLM delay)
+        const result = buildStoredNotification({
+            id: 'det-abc',
+            detectionEpoch,
+            cameraId: 'cam-1',
+            cameraName: 'Front Door',
+            detectionType: 'person',
+            names: ['Alice'],
+            enriched: {
+                title: 'Person Detected',
+                subtitle: 'Front Door',
+                body: 'Alice at the door',
+            },
+            hasPoster: true,
+        });
+
+        expect(result.timestamp).toBe(detectionEpoch);
+        expect(result.id).toBe('det-abc');
+        expect(result.cameraId).toBe('cam-1');
+        expect(result.llmTitle).toBe('Person Detected');
+        expect(result.hasPoster).toBe(true);
+    });
+
+    it('includes optional fields when provided', () => {
+        const detectionEpoch = Date.now();
+        const result = buildStoredNotification({
+            id: 'det-xyz',
+            detectionEpoch,
+            cameraId: 'cam-2',
+            cameraName: 'Backyard',
+            detectionType: 'animal',
+            names: [],
+            enriched: {
+                title: 'Animal',
+                subtitle: 'Backyard',
+                body: 'Cat spotted',
+                detailedDescription: 'Orange tabby near fence',
+                clarity: { score: 8, reason: 'clear' },
+            },
+            hasPoster: false,
+            llmIdentifiedNames: ['Whiskers'],
+        });
+
+        expect(result.timestamp).toBe(detectionEpoch);
+        expect(result.detailedDescription).toBe('Orange tabby near fence');
+        expect(result.clarity).toEqual({ score: 8, reason: 'clear' });
+        expect(result.llmIdentifiedNames).toEqual(['Whiskers']);
+    });
+
+    it('omits llmIdentifiedNames when not provided', () => {
+        const result = buildStoredNotification({
+            id: 'det-none',
+            detectionEpoch: Date.now(),
+            cameraId: 'cam-1',
+            cameraName: 'Garage',
+            detectionType: 'vehicle',
+            names: [],
+            enriched: { title: 'Car', subtitle: 'Garage', body: 'Vehicle detected' },
+            hasPoster: false,
+        });
+
+        expect(result.llmIdentifiedNames).toBeUndefined();
+    });
+});
+
+describe('cropJpeg', () => {
+    function makeJpeg(width: number, height: number): Buffer {
+        const jpegLib = require('jpeg-js');
+        // Create a gradient so we can verify crop region
+        const data = Buffer.alloc(width * height * 4);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const i = (y * width + x) * 4;
+                data[i] = Math.round((x / width) * 255);     // R = x gradient
+                data[i + 1] = Math.round((y / height) * 255); // G = y gradient
+                data[i + 2] = 0;
+                data[i + 3] = 255;
+            }
+        }
+        return Buffer.from(jpegLib.encode({ data, width, height }, 90).data);
+    }
+
+    it('crops to the specified pixel bbox region', () => {
+        const input = makeJpeg(100, 100);
+        // Crop center 50x50 with no padding
+        const cropped = cropJpeg(input, [25, 25, 50, 50], 0);
+        const jpegLib = require('jpeg-js');
+        const { width, height } = jpegLib.decode(cropped);
+        expect(width).toBe(50);
+        expect(height).toBe(50);
+    });
+
+    it('applies padding around the face bbox', () => {
+        const input = makeJpeg(200, 200);
+        // Face at center: [80, 80, 40, 40] = 40x40px
+        // With 0.5 padding: expand by 50% of face size each side = 20px each side
+        // Result: 80x80px
+        const cropped = cropJpeg(input, [80, 80, 40, 40], 0.5);
+        const jpegLib = require('jpeg-js');
+        const { width, height } = jpegLib.decode(cropped);
+        expect(width).toBe(80);
+        expect(height).toBe(80);
+    });
+
+    it('clamps to image bounds when padding exceeds edges', () => {
+        const input = makeJpeg(100, 100);
+        // Face at top-left corner with large padding
+        const cropped = cropJpeg(input, [0, 0, 20, 20], 1.0);
+        const jpegLib = require('jpeg-js');
+        const { width, height } = jpegLib.decode(cropped);
+        // Should not exceed image bounds
+        expect(width).toBeLessThanOrEqual(100);
+        expect(height).toBeLessThanOrEqual(100);
+        expect(width).toBeGreaterThan(20); // padded beyond face
+    });
+
+    it('returns valid JPEG buffer', () => {
+        const input = makeJpeg(100, 100);
+        const cropped = cropJpeg(input, [10, 10, 30, 30], 0.3);
+        // JPEG magic bytes
+        expect(cropped[0]).toBe(0xFF);
+        expect(cropped[1]).toBe(0xD8);
+    });
+
+    it('handles pixel coordinate bounding boxes (not normalized)', () => {
+        const input = makeJpeg(1920, 1080);
+        // Face at pixel coords: x=500, y=200, w=150, h=200
+        const cropped = cropJpeg(input, [500, 200, 150, 200], 0.5);
+        const jpegLib = require('jpeg-js');
+        const { width, height } = jpegLib.decode(cropped);
+        // With 0.5 padding: 150 + 2*75 = 300 wide, 200 + 2*100 = 400 tall
+        expect(width).toBe(300);
+        expect(height).toBe(400);
+    });
+});
+
+describe('parseFaceReferenceQuality', () => {
+    it('parses valid input', () => {
+        const result = parseFaceReferenceQuality({
+            score: 8, frontFacing: true, unobstructed: true, singleSubject: true,
+        });
+        expect(result).toEqual({
+            score: 8, frontFacing: true, unobstructed: true, singleSubject: true,
+        });
+    });
+
+    it('returns null for null input', () => {
+        expect(parseFaceReferenceQuality(null)).toBeNull();
+    });
+
+    it('returns null for undefined input', () => {
+        expect(parseFaceReferenceQuality(undefined)).toBeNull();
+    });
+
+    it('clamps score to 1-10 range', () => {
+        const result = parseFaceReferenceQuality({
+            score: 15, frontFacing: true, unobstructed: false, singleSubject: true,
+        });
+        expect(result!.score).toBe(10);
+    });
+
+    it('returns null for invalid structure (missing fields)', () => {
+        const mockConsole = { warn: jest.fn() };
+        const result = parseFaceReferenceQuality({ score: 5 }, mockConsole);
+        expect(result).toBeNull();
+        expect(mockConsole.warn).toHaveBeenCalled();
+    });
+
+    it('returns null when score is not a number', () => {
+        const result = parseFaceReferenceQuality({
+            score: 'high', frontFacing: true, unobstructed: true, singleSubject: true,
+        });
+        expect(result).toBeNull();
+    });
+});
+
+describe('extractFaceBoundingBox', () => {
+    it('returns boundingBox for matching labeled face', () => {
+        const detections = [
+            { className: 'person', boundingBox: [0.1, 0.1, 0.8, 0.9] },
+            { className: 'face', label: 'Richard', score: 0.95, boundingBox: [0.3, 0.2, 0.15, 0.2] },
+        ];
+        expect(extractFaceBoundingBox(detections, 'Richard')).toEqual([0.3, 0.2, 0.15, 0.2]);
+    });
+
+    it('returns undefined when name does not match', () => {
+        const detections = [
+            { className: 'face', label: 'Olesia', score: 0.9, boundingBox: [0.3, 0.2, 0.15, 0.2] },
+        ];
+        expect(extractFaceBoundingBox(detections, 'Richard')).toBeUndefined();
+    });
+
+    it('returns undefined when detection has no boundingBox', () => {
+        const detections = [
+            { className: 'face', label: 'Richard', score: 0.9 },
+        ];
+        expect(extractFaceBoundingBox(detections, 'Richard')).toBeUndefined();
+    });
+
+    it('returns undefined for empty detections', () => {
+        expect(extractFaceBoundingBox([], 'Richard')).toBeUndefined();
+    });
+
+    it('ignores non-face detections even with matching label', () => {
+        const detections = [
+            { className: 'person', label: 'Richard', boundingBox: [0.1, 0.1, 0.8, 0.9] },
+        ];
+        expect(extractFaceBoundingBox(detections, 'Richard')).toBeUndefined();
+    });
+
+    it('returns undefined when face bbox is too small (< minSize pixels)', () => {
+        const detections = [
+            { className: 'face', label: 'Richard', boundingBox: [400, 400, 20, 25] },
+        ];
+        // With minSize=50, a 20x25 face is too small
+        expect(extractFaceBoundingBox(detections, 'Richard', 50)).toBeUndefined();
+    });
+
+    it('returns bbox when face meets minimum size', () => {
+        const detections = [
+            { className: 'face', label: 'Richard', boundingBox: [300, 300, 100, 120] },
+        ];
+        expect(extractFaceBoundingBox(detections, 'Richard', 50)).toEqual([300, 300, 100, 120]);
     });
 });

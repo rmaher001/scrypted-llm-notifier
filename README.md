@@ -15,6 +15,8 @@ Vision LLM analyzes notification snapshots and generates contextual titles and d
 
 When multiple notifiers are triggered by the same event, only one AI analysis is performed.
 
+Optionally configure a separate **Notification LLM** for detection enrichment — for example, a fast local model (Ollama, llama.cpp) for real-time notifications while keeping a cloud provider for daily briefs. Multiple providers are load-balanced with round-robin.
+
 ### Notification Grouping *(optional)*
 Buffer notifications for a configurable window and group related events into a single notification via LLM. Reduces notification spam when multiple cameras trigger on the same activity.
 
@@ -23,14 +25,16 @@ Enable by setting **Grouping Window** to a value greater than 0.
 ### Daily Brief *(optional)*
 A web dashboard that summarizes your day's camera activity into an AI-generated narrative timeline with video clip playback.
 
-- Time-bucketed segments with highlights
+- Time-bucketed segments with highlights generated per 6-hour period
 - **Catch Me Up** button for incremental updates since last visit
 - Scheduled push notification with a link to the brief
 
 Enable daily notifications by turning on **Enable Daily Brief Notifications** in settings.
 
 ### Gallery
-A searchable history of all past notifications with poster-quality snapshots and video playback. Filter by camera, type, or person — and optionally enable semantic search to find events by visual description.
+A searchable history of all past notifications with poster-quality snapshots and video playback. Filter by camera, type, or person — and optionally enable semantic search to find events by visual description. The gallery updates in real time as new detections arrive.
+
+Click any event's video to open it in a player with a direct link to the NVR timeline for that camera at the detection timestamp.
 
 #### Semantic Search *(optional)*
 Add a **Gemini Embedding API Key** in settings to upgrade from keyword search to full semantic search — find events by visual concepts like "red backpack" or "person at front door".
@@ -38,7 +42,9 @@ Add a **Gemini Embedding API Key** in settings to upgrade from keyword search to
 Get a free API key at [Google AI Studio](https://aistudio.google.com/apikey).
 
 ### LLM Person Identification *(optional)*
-Builds a reference library of known faces from Scrypted's face recognition data, then uses the LLM to identify unrecognized people in future notifications.
+Builds a reference library of known faces from Scrypted's face recognition data, then uses the LLM to identify unrecognized people in future notifications. Reference photos are automatically cropped to the face region and ranked by quality — higher-scoring photos replace lower-scoring ones over time.
+
+Manage reference photos in the **People** tab of the web UI.
 
 Enable by turning on **LLM Person Identification** in settings.
 
@@ -47,6 +53,7 @@ Enable by turning on **LLM Person Identification** in settings.
 | Setting | Description | Default |
 |---------|-------------|---------|
 | LLM Providers | Vision-capable LLMs (load-balanced) | *(required)* |
+| Notification LLM | Separate provider(s) for real-time notifications | *(uses main)* |
 | Snapshot Mode | Cropped, Full, or Both | Cropped |
 | Grouping Window | Buffer seconds before grouping (0 = off) | 0 |
 | LLM Person Identification | Use LLM to identify unknown faces | Off |

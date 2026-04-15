@@ -38,6 +38,8 @@ class Gallery {
     this._loading = false;
     this._savedState = null;
     this._inGroupView = false;
+    this._sse = null;
+    this._pendingSSE = false;
 
     // DOM refs (set by _renderShell)
     this._gridEl = null;
@@ -58,6 +60,7 @@ class Gallery {
     this._initialized = true;
     this._renderShell();
     await this._fetchPage(1, {});
+    this._connectSSE();
   }
 
   async search(query) {
@@ -90,9 +93,40 @@ class Gallery {
   }
 
   destroy() {
+    if (this._sse) { this._sse.close(); this._sse = null; }
     if (this._debounceTimer) clearTimeout(this._debounceTimer);
     this._containerEl.innerHTML = '';
     this._initialized = false;
+  }
+
+  // ---- Internal: SSE ----
+
+  _connectSSE() {
+    if (typeof EventSource === 'undefined') return;
+    var self = this;
+    var url = this._buildUrl('/brief/gallery/sse');
+    this._sse = new EventSource(url);
+    this._sse.onmessage = function(e) {
+      if (e.data === 'new-notification') {
+        self._onSSEUpdate();
+      }
+    };
+    this._sse.onerror = function() {
+      console.log(self._logPrefix, 'SSE reconnecting...');
+    };
+  }
+
+  _onSSEUpdate() {
+    if (this._inGroupView) return;
+    if (this._loading) { this._pendingSSE = true; return; }
+    this._pendingSSE = false;
+    this._page = 1;
+    this._notifications = [];
+    if (this._searchQuery && this._searchQuery.trim()) {
+      this._fetchSearch(this._searchQuery, this._activeFilters);
+    } else {
+      this._fetchPage(1, this._activeFilters);
+    }
   }
 
   // ---- Internal: Data ----
@@ -129,6 +163,7 @@ class Gallery {
     } finally {
       this._loading = false;
       this._showLoading(false);
+      if (this._pendingSSE) this._onSSEUpdate();
     }
   }
 
@@ -161,6 +196,7 @@ class Gallery {
     } finally {
       this._loading = false;
       this._showLoading(false);
+      if (this._pendingSSE) this._onSSEUpdate();
     }
   }
 
@@ -261,7 +297,7 @@ class Gallery {
       var groupAttr = n.groupId ? ' data-group-id="' + self._escapeHtml(n.groupId) + '"' : '';
       var groupSizeAttr = (n.groupSize && n.groupSize > 1) ? ' data-group-size="' + n.groupSize + '"' : '';
       html +=
-        '<div class="gallery-card" data-id="' + escapedId + '" data-title="' + escapedTitle + '" data-body="' + escapedBody + '" data-time="' + escapedTime + '"' + groupAttr + groupSizeAttr + '>' +
+        '<div class="gallery-card" data-id="' + escapedId + '" data-title="' + escapedTitle + '" data-body="' + escapedBody + '" data-time="' + escapedTime + '" data-camera-id="' + self._escapeHtml(n.cameraId || '') + '" data-timestamp="' + (n.timestamp || '') + '"' + groupAttr + groupSizeAttr + '>' +
           '<div class="gallery-card-thumb">' +
             (thumbSrc ? '<img src="' + thumbSrc + '" alt="" loading="lazy" />' : '<div class="gallery-card-no-thumb"></div>') +
             groupBadge + nameBadge +
@@ -283,9 +319,11 @@ class Gallery {
         var t = this.getAttribute('data-title');
         var b = this.getAttribute('data-body');
         var tm = this.getAttribute('data-time');
+        var cid = this.getAttribute('data-camera-id');
+        var ts = this.getAttribute('data-timestamp');
         var gid = this.getAttribute('data-group-id');
         var gs = parseInt(this.getAttribute('data-group-size') || '0', 10);
-        self._onCardClick(id, t, b, tm, gid, gs);
+        self._onCardClick(id, t, b, tm, cid, ts, gid, gs);
       });
     }
 
@@ -360,7 +398,7 @@ class Gallery {
     this.applyFilters(filters);
   }
 
-  _onCardClick(notificationId, title, body, time, groupId, groupSize) {
+  _onCardClick(notificationId, title, body, time, cameraId, timestamp, groupId, groupSize) {
     // If clicking a grouped card (with multiple events) and not already in group view, drill down
     if (groupId && groupSize > 1 && !this._inGroupView) {
       console.log(this._logPrefix, 'Drilling into group:', groupId, '(' + groupSize + ' events)');
@@ -369,7 +407,7 @@ class Gallery {
     }
     console.log(this._logPrefix, 'Card clicked:', notificationId, title);
     if (this._onCardClickFn) {
-      this._onCardClickFn(notificationId, title, body, time);
+      this._onCardClickFn(notificationId, title, body, time, cameraId, timestamp);
     }
   }
 
@@ -413,6 +451,7 @@ class Gallery {
     } finally {
       this._loading = false;
       this._showLoading(false);
+      if (this._pendingSSE) this._onSSEUpdate();
     }
   }
 

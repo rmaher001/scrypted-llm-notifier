@@ -2,7 +2,7 @@
  * Tests for /brief/people and /brief/people/photo endpoint handlers.
  */
 
-import { handlePeopleRequest, handlePeoplePhotoRequest } from '../src/gallery';
+import { handlePeopleRequest, handlePeoplePhotoRequest, handlePeopleDeleteRequest } from '../src/gallery';
 import { PersonStore } from '../src/person-store';
 
 // Mock PersonStore
@@ -109,5 +109,95 @@ describe('handlePeoplePhotoRequest', () => {
         );
 
         expect(result.code).toBe(400);
+    });
+});
+
+describe('handlePeopleDeleteRequest', () => {
+    it('returns 200 and removes person', async () => {
+        const store = {
+            ...createMockPersonStore([], new Map()),
+            remove: jest.fn().mockResolvedValue(true),
+        } as any;
+        const result = await handlePeopleDeleteRequest(
+            'http://localhost/brief/people/delete?name=Richard',
+            store,
+        );
+        expect(result.code).toBe(200);
+        expect(store.remove).toHaveBeenCalledWith('Richard');
+    });
+
+    it('returns 404 when person not found', async () => {
+        const store = {
+            ...createMockPersonStore([], new Map()),
+            remove: jest.fn().mockResolvedValue(false),
+        } as any;
+        const result = await handlePeopleDeleteRequest(
+            'http://localhost/brief/people/delete?name=Unknown',
+            store,
+        );
+        expect(result.code).toBe(404);
+    });
+
+    it('returns 400 for missing name param', async () => {
+        const store = createMockPersonStore([], new Map()) as any;
+        store.remove = jest.fn();
+        const result = await handlePeopleDeleteRequest(
+            'http://localhost/brief/people/delete',
+            store,
+        );
+        expect(result.code).toBe(400);
+        expect(store.remove).not.toHaveBeenCalled();
+    });
+});
+
+describe('handleGalleryDataRequest NaN guards', () => {
+    const { handleGalleryDataRequest } = require('../src/gallery');
+
+    function createMockStore(notifications: any[]) {
+        return {
+            getAll: () => notifications,
+            getAllIds: () => new Set(notifications.map((n: any) => n.id)),
+            getById: (id: string) => notifications.find((n: any) => n.id === id),
+            getAllEmbeddings: () => new Map(),
+        };
+    }
+
+    it('returns 200 for non-numeric page/pageSize params', async () => {
+        const store = createMockStore([]);
+        const result = await handleGalleryDataRequest(
+            'http://localhost/brief/gallery/data?page=abc&pageSize=xyz',
+            store as any,
+            '/base',
+        );
+        expect(result.code).toBe(200);
+        const data = JSON.parse(result.body);
+        expect(data.page).toBe(1);
+    });
+
+    it('returns 200 for pageSize=0', async () => {
+        const store = createMockStore([]);
+        const result = await handleGalleryDataRequest(
+            'http://localhost/brief/gallery/data?pageSize=0',
+            store as any,
+            '/base',
+        );
+        expect(result.code).toBe(200);
+    });
+
+    it('returns notifications sorted newest first', async () => {
+        const store = createMockStore([
+            { id: 'old', timestamp: 1000, cameraId: 'c1', cameraName: 'Cam', detectionType: 'person', names: [], llmTitle: 'Old', llmBody: '', hasPoster: false },
+            { id: 'new', timestamp: 3000, cameraId: 'c1', cameraName: 'Cam', detectionType: 'person', names: [], llmTitle: 'New', llmBody: '', hasPoster: false },
+            { id: 'mid', timestamp: 2000, cameraId: 'c1', cameraName: 'Cam', detectionType: 'person', names: [], llmTitle: 'Mid', llmBody: '', hasPoster: false },
+        ]);
+        const result = await handleGalleryDataRequest(
+            'http://localhost/brief/gallery/data',
+            store as any,
+            '/base',
+        );
+        const data = JSON.parse(result.body);
+        expect(data.notifications[0].llmTitle).toBe('New');
+        expect(data.notifications[1].llmTitle).toBe('Mid');
+        expect(data.notifications[2].llmTitle).toBe('Old');
     });
 });

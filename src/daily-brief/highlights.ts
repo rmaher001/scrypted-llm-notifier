@@ -38,9 +38,7 @@ export function buildCachedHighlights(
             title: n.llmTitle,
             subtitle: n.llmSubtitle,
             body: n.llmBody,
-            thumbnail: (n.hasPoster || n.thumbnailB64)
-                ? (n.thumbnailB64 ? `data:image/jpeg;base64,${n.thumbnailB64}` : 'poster')
-                : '',
+            thumbnail: n.hasPoster ? 'poster' : '',
             index: indexMap.get(id),  // Store the original index for narrative linking
             names: n.names?.length > 0 ? n.names : undefined,
             llmIdentifiedName: n.llmIdentifiedName,

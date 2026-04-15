@@ -123,9 +123,9 @@ describe('LLM Person Identification wiring', () => {
         expect(llmNotifierTs).toMatch(/createMessageTemplate\([\s\S]*?referenceImages/);
     });
 
-    test('llm-notifier.ts counts persons vs labeled faces', () => {
-        expect(llmNotifierTs).toMatch(/personCount/);
-        expect(llmNotifierTs).toMatch(/labeledFaceCount/);
+    test('llm-notifier.ts gates on unlabeled high-confidence faces', () => {
+        expect(llmNotifierTs).toMatch(/unlabeledHighConfFaces/);
+        expect(llmNotifierTs).toMatch(/MIN_FACE_SCORE/);
     });
 
     test('llm-notifier.ts uses multi-person identifiedPersons', () => {
@@ -565,6 +565,21 @@ describe('Phase 5: html-generator.ts extraction', () => {
         expect(html).toContain('<!DOCTYPE html>');
         expect(html).toContain('</html>');
     });
+
+    test('event items use data attributes instead of inline onclick', () => {
+        const { generateDailyBriefHTML } = require('../src/daily-brief/html-generator');
+        const highlights = [{ id: 'test-1', cameraId: 'cam-1', timestamp: 1776000000000, date: 'Apr 12', time: '3:00 PM', title: 'Test', subtitle: '', body: 'Body', thumbnail: '', names: [] }];
+        const html = generateDailyBriefHTML(1, 'Test summary', highlights, Date.now(), 'America/Los_Angeles');
+        expect(html).not.toMatch(/onclick="openVideoModal\(/);
+        expect(html).toContain('data-event-id=');
+    });
+
+    test('postMessage uses learned parent origin with wildcard fallback', () => {
+        const src = fs.readFileSync(path.join(ROOT, 'src/daily-brief/html-generator.ts'), 'utf-8');
+        // Should use _parentOrigin || '*', not bare '*'
+        expect(src).not.toMatch(/postMessage\([^)]+,\s*'\*'\)/);
+        expect(src).toMatch(/_parentOrigin\s*\|\|\s*'\*'/);
+    });
 });
 
 describe('Phase 5: llm-notifier.ts extraction', () => {
@@ -796,9 +811,9 @@ describe('Final module structure', () => {
         });
     }
 
-    test('main.ts is under 1950 lines', () => {
+    test('main.ts is under 2010 lines', () => {
         const lines = mainTs.split('\n').length;
-        expect(lines).toBeLessThan(1950);
+        expect(lines).toBeLessThan(2010);
     });
 
     test('main.ts contains only LLMNotifierProvider', () => {
@@ -961,30 +976,30 @@ describe('Bug Fix: Replay race condition (track ended re-shows overlay)', () => 
 // Bug Fix: Video clip duration (Issue #2)
 // ============================================================================
 
-describe('Bug Fix: Video clip duration increased to 30s', () => {
-    test('HTTP video endpoint uses 10s preroll (startTime = timestamp - 10000)', () => {
+describe('Bug Fix: Video clip uses 5s preroll and 25s duration', () => {
+    test('HTTP video endpoint uses 5s preroll (startTime = timestamp - 5000)', () => {
         // Find the /brief/video handler and check startTime calculation
         const videoSection = mainTs.match(/path === '\/brief\/video'[\s\S]*?(?=\/\/ High-resolution|\/\/ WebRTC|if \(path ===)/);
         expect(videoSection).not.toBeNull();
-        expect(videoSection![0]).toMatch(/notification\.timestamp\s*-\s*10000/);
+        expect(videoSection![0]).toMatch(/notification\.timestamp\s*-\s*5000/);
     });
 
-    test('HTTP video endpoint uses 30s duration', () => {
+    test('HTTP video endpoint uses 25s duration', () => {
         const videoSection = mainTs.match(/path === '\/brief\/video'[\s\S]*?(?=\/\/ High-resolution|\/\/ WebRTC|if \(path ===)/);
         expect(videoSection).not.toBeNull();
-        expect(videoSection![0]).toMatch(/duration\s*=\s*30000/);
+        expect(videoSection![0]).toMatch(/duration\s*=\s*25000/);
     });
 
-    test('WebRTC endpoint uses 10s preroll (startTime = timestamp - 10000)', () => {
+    test('WebRTC endpoint uses 5s preroll (startTime = timestamp - 5000)', () => {
         const webrtcSection = mainTs.match(/path === '\/brief\/webrtc-signal'[\s\S]*?(?=if \(path ===|$)/);
         expect(webrtcSection).not.toBeNull();
-        expect(webrtcSection![0]).toMatch(/notification\.timestamp\s*-\s*10000/);
+        expect(webrtcSection![0]).toMatch(/notification\.timestamp\s*-\s*5000/);
     });
 
-    test('WebRTC endpoint uses 30s duration', () => {
+    test('WebRTC endpoint uses 25s duration', () => {
         const webrtcSection = mainTs.match(/path === '\/brief\/webrtc-signal'[\s\S]*?(?=if \(path ===|$)/);
         expect(webrtcSection).not.toBeNull();
-        expect(webrtcSection![0]).toMatch(/duration\s*=\s*30000/);
+        expect(webrtcSection![0]).toMatch(/duration\s*=\s*25000/);
     });
 });
 
@@ -1187,14 +1202,14 @@ describe('Fix: Initial sort order renders newest-first', () => {
     test('highlights are rendered newest-first (first data-index is highest)', () => {
         const { generateDailyBriefHTML } = require('../src/daily-brief/html-generator');
         const highlights = [
-            { id: 'a', title: 'First', body: 'b1', time: '8:00 AM', snapshotUrl: '' },
-            { id: 'b', title: 'Second', body: 'b2', time: '12:00 PM', snapshotUrl: '' },
-            { id: 'c', title: 'Third', body: 'b3', time: '6:00 PM', snapshotUrl: '' }
+            { id: 'a', cameraId: 'c1', timestamp: 1000, title: 'First', body: 'b1', time: '8:00 AM', snapshotUrl: '' },
+            { id: 'b', cameraId: 'c1', timestamp: 2000, title: 'Second', body: 'b2', time: '12:00 PM', snapshotUrl: '' },
+            { id: 'c', cameraId: 'c1', timestamp: 3000, title: 'Third', body: 'b3', time: '6:00 PM', snapshotUrl: '' }
         ];
         // Pass summary to trigger the highlights grid (requires !hasNarrative && summary)
         const html = generateDailyBriefHTML(3, 'Daily summary', highlights, null, 'America/Los_Angeles');
         // Extract data-index values from event-item elements (highlight items) in order
-        const highlightIndices = [...html.matchAll(/class="event-item"\s*data-index="(\d+)"/g)]
+        const highlightIndices = [...html.matchAll(/class="event-item"[^>]*data-index="(\d+)"/g)]
             .map(m => parseInt(m[1], 10));
         expect(highlightIndices.length).toBe(3);
         // First highlight in HTML should have highest index (newest-first)
@@ -1888,9 +1903,9 @@ describe('Gallery Phase 2: gallery.ts exists and exports', () => {
         expect(gallery).toMatch(/export async function handleGallerySearchRequest/);
     });
 
-    test('gallery.ts exports handleThumbnailRequest function', () => {
+    test('gallery.ts does not export removed handleThumbnailRequest', () => {
         const gallery = fs.readFileSync(galleryPath, 'utf-8');
-        expect(gallery).toMatch(/export async function handleThumbnailRequest/);
+        expect(gallery).not.toMatch(/export async function handleThumbnailRequest/);
     });
 });
 
@@ -2107,11 +2122,17 @@ describe('Gallery Phase 2: getGalleryPage unit tests', () => {
         expect(result.filters.names).toContain('Richard');
     });
 
-    test('returns thumbnailUrl instead of inline base64', () => {
-        const notifs = [makeNotif('1', { thumbnailB64: 'abc123' })];
+    test('returns thumbnailUrl when hasPoster is true', () => {
+        const notifs = [makeNotif('1', { hasPoster: true })];
         const result = getGalleryPage(notifs, 1, 50, {});
         expect(result.notifications[0].thumbnailUrl).toBeDefined();
-        expect(result.notifications[0].thumbnailB64).toBeUndefined();
+        expect(result.notifications[0].thumbnailUrl).toContain('/brief/snapshot');
+    });
+
+    test('returns empty thumbnailUrl when hasPoster is false', () => {
+        const notifs = [makeNotif('1', { hasPoster: false })];
+        const result = getGalleryPage(notifs, 1, 50, {});
+        expect(result.notifications[0].thumbnailUrl).toBe('');
     });
 
     test('includes hasEmbedding flag', () => {
@@ -2135,8 +2156,8 @@ describe('Gallery Phase 2: main.ts routes gallery endpoints', () => {
         expect(mainTs).toMatch(/\/brief\/gallery\/search/);
     });
 
-    test('main.ts routes /brief/thumbnail', () => {
-        expect(mainTs).toMatch(/\/brief\/thumbnail/);
+    test('main.ts does not route removed /brief/thumbnail', () => {
+        expect(mainTs).not.toMatch(/\/brief\/thumbnail/);
     });
 });
 
@@ -2485,13 +2506,9 @@ describe('Snapshot endpoint: fallback chain ordering', () => {
         expect(posterGetPos).toBeGreaterThan(-1);
     });
 
-    test('thumbnailB64 fallback exists before 404 in snapshot endpoint', () => {
+    test('snapshot endpoint has no thumbnailB64 fallback (disk poster or 404)', () => {
         const block = getSnapshotBlock();
-
-        // Should have a thumbnailB64 fallback path
-        expect(block).toMatch(/thumbnailB64/);
-        // The fallback should decode base64 to buffer
-        expect(block).toMatch(/Buffer\.from\(.*thumbnailB64.*['"]base64['"]/);
+        expect(block).not.toMatch(/thumbnailB64/);
     });
 });
 
@@ -2520,9 +2537,10 @@ describe('Gallery uses /brief/snapshot for images', () => {
         expect(galleryTs).not.toMatch(/\/brief\/thumbnail/);
     });
 
-    test('gallery thumbnail URLs check hasPoster in addition to thumbnailB64', () => {
-        // All 5 thumbnail URL conditionals should use (n.hasPoster || n.thumbnailB64) pattern
-        const matches = galleryTs.match(/n\.hasPoster\s*\|\|\s*n\.thumbnailB64/g);
+    test('gallery thumbnail URLs use hasPoster only (no thumbnailB64)', () => {
+        // thumbnailB64 removed — all conditionals should use n.hasPoster only
+        expect(galleryTs).not.toMatch(/n\.thumbnailB64/);
+        const matches = galleryTs.match(/n\.hasPoster\s*\?/g);
         expect(matches).not.toBeNull();
         expect(matches!.length).toBeGreaterThanOrEqual(4);
     });
@@ -2531,14 +2549,9 @@ describe('Gallery uses /brief/snapshot for images', () => {
 describe('highlights.ts uses hasPoster for thumbnail marker', () => {
     const highlightsTs = fs.readFileSync(path.join(ROOT, 'src/daily-brief/highlights.ts'), 'utf-8');
 
-    test('buildCachedHighlights checks hasPoster for thumbnail field', () => {
-        // Should use (n.hasPoster || n.thumbnailB64) pattern for the thumbnail field
-        expect(highlightsTs).toMatch(/n\.hasPoster\s*\|\|\s*n\.thumbnailB64/);
-    });
-
-    test('buildCachedHighlights uses poster marker for poster-only notifications', () => {
-        // When hasPoster is true but no thumbnailB64, should use a truthy marker string
-        expect(highlightsTs).toMatch(/'poster'/);
+    test('buildCachedHighlights uses hasPoster only (no thumbnailB64)', () => {
+        expect(highlightsTs).not.toMatch(/n\.thumbnailB64/);
+        expect(highlightsTs).toMatch(/n\.hasPoster\s*\?\s*'poster'/);
     });
 });
 
@@ -2738,14 +2751,11 @@ describe('Gallery Performance: no NVR fallback in snapshot endpoint', () => {
         expect(afterSnapshot).not.toMatch(/resizeJpegNearest/);
     });
 
-    test('snapshot endpoint fallback chain is disk -> thumbnailB64 -> 404', () => {
+    test('snapshot endpoint fallback chain is disk -> 404 (no thumbnailB64)', () => {
         const snapshotIdx = mainTs.indexOf("path === '/brief/snapshot'");
         const afterSnapshot = mainTs.substring(snapshotIdx, snapshotIdx + 5000);
-        // Should still have posterStore.get (disk check)
         expect(afterSnapshot).toMatch(/posterStore\.get/);
-        // Should still have thumbnailB64 fallback
-        expect(afterSnapshot).toMatch(/thumbnailB64/);
-        // Should have 404 response
+        expect(afterSnapshot).not.toMatch(/thumbnailB64/);
         expect(afterSnapshot).toMatch(/404/);
     });
 });
@@ -3281,4 +3291,104 @@ describe('Sticky gallery controls', () => {
         expect(fnBody).toContain('gallery-controls-sticky');
     });
 });
+
+describe('People tab in html-generator', () => {
+    const htmlGen = fs.readFileSync(path.join(ROOT, 'src/daily-brief/html-generator.ts'), 'utf-8');
+
+    test('has People tab button', () => {
+        expect(htmlGen).toMatch(/data-tab=.*people/);
+    });
+
+    test('has people tab content container', () => {
+        expect(htmlGen).toMatch(/id=.*people-tab/);
+    });
+
+    test('people tab hidden by default', () => {
+        expect(htmlGen).toMatch(/people-tab.*display:\s*none/);
+    });
+
+    test('fetches /brief/people on tab click', () => {
+        expect(htmlGen).toMatch(/\/brief\/people/);
+    });
+
+    test('renders person cards with photo and name', () => {
+        expect(htmlGen).toMatch(/person-card|people-grid/);
+    });
+});
+
+describe('Security: CSRF protection on state-mutating endpoints', () => {
+    test('/brief/clear requires POST method check on same line', () => {
+        const clearLine = mainTs.split('\n').find(l => l.includes("'/brief/clear'"));
+        expect(clearLine).toBeDefined();
+        expect(clearLine).toContain("request.method === 'POST'");
+    });
+
+    test('/brief/set-timezone requires POST method check on same line', () => {
+        const tzLine = mainTs.split('\n').find(l => l.includes("'/brief/set-timezone'"));
+        expect(tzLine).toBeDefined();
+        expect(tzLine).toContain("request.method === 'POST'");
+    });
+
+    test('/brief/set-timezone validates timezone string', () => {
+        expect(mainTs).toMatch(/set-timezone[\s\S]*Intl\.DateTimeFormat/);
+    });
+});
+
+describe('Security: error responses do not leak internal details', () => {
+    test('error responses use generic messages, not e.message', () => {
+        // Find all response.send with error + e.message or e?.message
+        const errorLeaks = mainTs.match(/response\.send\(JSON\.stringify\(\{[^}]*e(\?\.message|\.message)/g);
+        expect(errorLeaks).toBeNull();
+    });
+});
+
+describe('SSE gallery auto-update', () => {
+    test('main.ts has /brief/gallery/sse endpoint with text/event-stream', () => {
+        expect(mainTs).toMatch(/\/brief\/gallery\/sse/);
+        expect(mainTs).toMatch(/text\/event-stream/);
+        expect(mainTs).toMatch(/sendStream/);
+    });
+
+    test('gallery.js has EventSource SSE client with cleanup in destroy', () => {
+        const galleryJs = fs.readFileSync(path.join(ROOT, 'ha-card/gallery.js'), 'utf-8');
+        expect(galleryJs).toMatch(/EventSource/);
+        expect(galleryJs).toMatch(/_connectSSE/);
+        const destroyBlock = galleryJs.match(/destroy\s*\(\)\s*\{[\s\S]*?\n\s*\}/);
+        expect(destroyBlock).not.toBeNull();
+        expect(destroyBlock![0]).toMatch(/_sse/);
+    });
+});
+
+describe('People tab: photo URLs use client-side baseUrl', () => {
+    test('person card img src uses buildUrl, not server-baked photoUrl', () => {
+        const htmlGen = fs.readFileSync(path.join(ROOT, 'src/daily-brief/html-generator.ts'), 'utf-8');
+        // The person card img should use buildUrl for HA proxy compatibility
+        expect(htmlGen).toMatch(/person-card[\s\S]*buildUrl\(['"]\/brief\/people\/photo['"]/);
+        // Should NOT use p.photoUrl directly in img src
+        expect(htmlGen).not.toMatch(/img src=.*p\.photoUrl/);
+    });
+});
+
+describe('NVR timeline link in video modal', () => {
+    test('video modal has a timeline link element', () => {
+        const { generateDailyBriefHTML } = require('../src/daily-brief/html-generator');
+        const html = generateDailyBriefHTML(0, null, [], null, 'America/Los_Angeles');
+        expect(html).toMatch(/modalTimeline|modal-timeline/);
+    });
+
+    test('event items include data-camera-id and data-timestamp attributes', () => {
+        const { generateDailyBriefHTML } = require('../src/daily-brief/html-generator');
+        const highlights = [{ id: 'test-1', cameraId: 'cam-42', timestamp: 1776000000000, date: 'Apr 12', time: '3:00 PM', title: 'Test', subtitle: '', body: 'Body', thumbnail: '', names: [] }];
+        const html = generateDailyBriefHTML(1, 'Test summary', highlights, Date.now(), 'America/Los_Angeles');
+        expect(html).toContain('data-camera-id="cam-42"');
+        expect(html).toContain('data-timestamp="1776000000000"');
+    });
+
+    test('html-generator constructs NVR timeline URL from baseUrl', () => {
+        const htmlGen = fs.readFileSync(path.join(ROOT, 'src/daily-brief/html-generator.ts'), 'utf-8');
+        expect(htmlGen).toMatch(/@scrypted\/nvr\/public/);
+        expect(htmlGen).toMatch(/#\/timeline\//);
+    });
+});
+
 

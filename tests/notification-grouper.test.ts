@@ -64,6 +64,16 @@ describe('buildGroupingPrompt', () => {
         expect(userContent).toContain('Male in blue jacket walking on driveway');
     });
 
+    it('includes subtitle in the prompt line', () => {
+        const notifications = [
+            makeBuffered('n1', { subtitle: 'Near garage' }),
+        ];
+        const result = buildGroupingPrompt(notifications);
+        const userContent = result.messages[1].content;
+
+        expect(userContent).toContain('Near garage');
+    });
+
     it('includes response_format with json_schema', () => {
         const notifications = [makeBuffered('n1')];
         const result = buildGroupingPrompt(notifications);
@@ -147,6 +157,69 @@ describe('parseGroupingResponse', () => {
             ],
         });
         expect(() => parseGroupingResponse(json)).toThrow('empty notificationIds');
+    });
+
+    it('strips ```json fences from response', () => {
+        const inner = JSON.stringify({
+            groups: [{
+                notificationIds: ['abc'],
+                title: 'Fenced',
+                subtitle: 'Test',
+                body: 'Body text',
+            }],
+        });
+        const fenced = '```json\n' + inner + '\n```';
+
+        const result = parseGroupingResponse(fenced);
+        expect(result.groups).toHaveLength(1);
+        expect(result.groups[0].title).toBe('Fenced');
+    });
+
+    it('does not truncate JSON body containing backticks', () => {
+        const inner = JSON.stringify({
+            groups: [{
+                notificationIds: ['abc'],
+                title: 'Has Backticks',
+                subtitle: 'Test',
+                body: 'See ```code``` for details',
+            }],
+        });
+        const fenced = '```json\n' + inner + '\n```';
+
+        const result = parseGroupingResponse(fenced);
+        expect(result.groups[0].body).toBe('See ```code``` for details');
+    });
+
+    it('handles opening fence with no closing fence', () => {
+        const inner = JSON.stringify({
+            groups: [{
+                notificationIds: ['abc'],
+                title: 'No Close',
+                subtitle: 'Test',
+                body: 'Body text',
+            }],
+        });
+        const fenced = '```json\n' + inner;
+
+        const result = parseGroupingResponse(fenced);
+        expect(result.groups).toHaveLength(1);
+        expect(result.groups[0].title).toBe('No Close');
+    });
+
+    it('strips plain ``` fences from response', () => {
+        const inner = JSON.stringify({
+            groups: [{
+                notificationIds: ['abc'],
+                title: 'Plain Fence',
+                subtitle: 'Test',
+                body: 'Body text',
+            }],
+        });
+        const fenced = '```\n' + inner + '\n```';
+
+        const result = parseGroupingResponse(fenced);
+        expect(result.groups).toHaveLength(1);
+        expect(result.groups[0].title).toBe('Plain Fence');
     });
 });
 

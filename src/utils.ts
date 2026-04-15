@@ -30,6 +30,61 @@ export function parseClarity(raw: any, console?: { warn: (msg: string, ...args: 
     return { score: clampedScore, reason: raw.reason };
 }
 
+export interface FaceReferenceQuality {
+    score: number;
+    frontFacing: boolean;
+    unobstructed: boolean;
+    singleSubject: boolean;
+}
+
+export function parseFaceReferenceQuality(
+    raw: any,
+    console?: { warn: (msg: string, ...args: any[]) => void },
+): FaceReferenceQuality | null {
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw.score !== 'number' || typeof raw.frontFacing !== 'boolean'
+        || typeof raw.unobstructed !== 'boolean' || typeof raw.singleSubject !== 'boolean') {
+        console?.warn('[FaceRefQuality] Invalid format from LLM:', raw);
+        return null;
+    }
+    const score = Math.max(1, Math.min(10, Math.round(raw.score)));
+    return { score, frontFacing: raw.frontFacing, unobstructed: raw.unobstructed, singleSubject: raw.singleSubject };
+}
+
+export function cropJpeg(
+    input: Buffer,
+    bbox: [number, number, number, number],
+    padding: number,
+    quality = 80,
+): Buffer {
+    const { data: src, width: sw, height: sh } = jpeg.decode(input, { useTArray: true });
+    const [bx, by, bw, bh] = bbox;
+
+    // Apply padding (fraction of face size)
+    const padX = bw * padding;
+    const padY = bh * padding;
+
+    // Compute crop region, clamped to image bounds
+    const x0 = Math.max(0, Math.floor(bx - padX));
+    const y0 = Math.max(0, Math.floor(by - padY));
+    const x1 = Math.min(sw, Math.ceil(bx + bw + padX));
+    const y1 = Math.min(sh, Math.ceil(by + bh + padY));
+    const cw = x1 - x0;
+    const ch = y1 - y0;
+    if (cw <= 0 || ch <= 0) throw new Error(`cropJpeg: degenerate crop (cw=${cw}, ch=${ch})`);
+
+    // Extract pixels
+    const dst = Buffer.allocUnsafe(cw * ch * 4);
+    for (let y = 0; y < ch; y++) {
+        const srcOffset = ((y0 + y) * sw + x0) * 4;
+        const dstOffset = y * cw * 4;
+        dst.set(src.subarray(srcOffset, srcOffset + cw * 4), dstOffset);
+    }
+
+    const { data } = jpeg.encode({ data: dst, width: cw, height: ch }, quality);
+    return Buffer.from(data);
+}
+
 export function withTimeout<T>(p: Promise<T>, ms: number, label?: string): Promise<T> {
     let to: NodeJS.Timeout;
     const timeout = new Promise<T>((_, reject) => {
@@ -89,8 +144,49 @@ export async function resizeJpegNearest(input: Buffer, targetWidth: number, qual
 }
 
 export function getJpegDimensions(input: Buffer): { width: number; height: number } {
-    const { width, height } = jpeg.decode(input, { useTArray: true });
-    return { width, height };
+    // Parse JPEG SOF marker for dimensions without decoding pixel data
+    if (input.length < 2 || input[0] !== 0xFF || input[1] !== 0xD8) {
+        throw new Error('Not a JPEG');
+    }
+    let offset = 2;
+    while (offset < input.length - 1) {
+        if (input[offset] !== 0xFF) {
+            throw new Error('Invalid JPEG marker');
+        }
+        // Skip 0xFF fill bytes (JPEG spec B.1.1.2)
+        while (offset < input.length - 1 && input[offset + 1] === 0xFF) {
+            offset++;
+        }
+        const marker = input[offset + 1];
+        // All SOF markers (0xC0-0xCF) except DHT (0xC4), reserved (0xC8), DAC (0xCC)
+        if ((marker >= 0xC0 && marker <= 0xC3) ||
+            (marker >= 0xC5 && marker <= 0xC7) ||
+            (marker >= 0xC9 && marker <= 0xCB) ||
+            (marker >= 0xCD && marker <= 0xCF)) {
+            if (offset + 8 >= input.length) throw new Error('Truncated JPEG: SOF marker incomplete');
+            const height = input.readUInt16BE(offset + 5);
+            const width = input.readUInt16BE(offset + 7);
+            return { width, height };
+        }
+        // Skip marker segment
+        if (offset + 3 >= input.length) throw new Error('Truncated JPEG');
+        const segLen = input.readUInt16BE(offset + 2);
+        offset += 2 + segLen;
+    }
+    throw new Error('No SOF marker found in JPEG');
+}
+
+export function stripJsonFences(content: string): string {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('```')) return trimmed;
+    const firstNewline = trimmed.indexOf('\n');
+    if (firstNewline === -1) return trimmed;
+    const body = trimmed.slice(firstNewline + 1);
+    const trimmedBody = body.trimEnd();
+    if (trimmedBody.endsWith('```')) {
+        return trimmedBody.slice(0, -3).trimEnd();
+    }
+    return body.trim();
 }
 
 export function buildImageList(mode: string, full?: string, cropped?: string): string[] {

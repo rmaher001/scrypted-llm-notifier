@@ -44,9 +44,6 @@ export function generateDailyBriefHTML(
 
     // Helper to render a cached highlight (compact version for timeline)
     const renderHighlightItem = (h: CachedHighlight, compact: boolean = false, index?: number) => {
-        // Escape single quotes in title/body for onclick handler
-        const escapedTitle = escapeHtml(h.title).replace(/'/g, "\\'");
-        const escapedBody = escapeHtml(h.body).replace(/'/g, "\\'");
         const itemClass = compact ? 'event-item timeline-item' : 'event-item';
         const indexAttr = index !== undefined ? ` data-index="${index}"` : '';
         // Name badges: Scrypted (green), LLM (teal), Both (purple) — stacked for multi-person
@@ -61,9 +58,9 @@ export function generateDailyBriefHTML(
                 : badgeHtml;
         }
         return `
-        <div class="${itemClass}"${indexAttr} onclick="openVideoModal('${h.id}', '${escapedTitle}', '${escapedBody}', '${h.time}')">
+        <div class="${itemClass}"${indexAttr} data-event-id="${escapeHtml(h.id)}" data-event-title="${escapeHtml(h.title)}" data-event-body="${escapeHtml(h.body)}" data-event-time="${escapeHtml(h.time)}" data-camera-id="${escapeHtml(h.cameraId)}" data-timestamp="${h.timestamp}">
             <div class="event-thumb">
-                ${h.thumbnail ? `<img src="${h.thumbnail.startsWith('data:') ? h.thumbnail : ''}" alt=""${h.thumbnail === 'poster' ? ` data-poster-id="${escapeHtml(h.id)}"` : ''}>` : '<div class="no-thumb"></div>'}
+                ${h.thumbnail === 'poster' ? `<img src="" alt="" data-poster-id="${escapeHtml(h.id)}">` : '<div class="no-thumb"></div>'}
                 ${nameBadge}
             </div>
             <div class="event-meta">
@@ -314,6 +311,59 @@ export function generateDailyBriefHTML(
             max-width: 800px;
             margin: 0 auto;
             padding: 16px 20px;
+        }
+
+        /* People tab */
+        .people-container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 16px 20px;
+        }
+        .people-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 16px;
+        }
+        .person-card {
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            overflow: hidden;
+            text-align: center;
+        }
+        .person-card img {
+            width: 100%;
+            aspect-ratio: 1;
+            object-fit: cover;
+        }
+        .person-card .person-info {
+            padding: 8px;
+        }
+        .person-card .person-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: var(--text-primary);
+        }
+        .person-card .person-meta {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+        .person-delete {
+            background: none;
+            border: 1px solid rgba(255,59,48,0.4);
+            color: #ff3b30;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 11px;
+            cursor: pointer;
+            margin-top: 6px;
+        }
+        .person-delete:hover { background: rgba(255,59,48,0.15); }
+        .people-empty {
+            text-align: center;
+            color: var(--text-secondary);
+            padding: 40px 20px;
+            font-size: 14px;
         }
 
         .summary-generating {
@@ -643,6 +693,15 @@ export function generateDailyBriefHTML(
             font-size: 16px;
             padding: 40px;
         }
+        .modal-timeline {
+            display: inline-block;
+            color: var(--accent, #6c63ff);
+            font-size: 13px;
+            margin-top: 8px;
+            text-decoration: none;
+            text-align: center;
+        }
+        .modal-timeline:hover { text-decoration: underline; }
         .modal-status {
             color: white;
             font-size: 13px;
@@ -709,6 +768,7 @@ export function generateDailyBriefHTML(
     <div class="tab-bar">
         <button class="tab active" data-tab="brief">Brief</button>
         <button class="tab" data-tab="gallery">Gallery</button>
+        <button class="tab" data-tab="people">People</button>
     </div>
 
     <div id="brief-tab" class="tab-content">
@@ -760,6 +820,12 @@ export function generateDailyBriefHTML(
         <div class="gallery-container"></div>
     </div>
 
+    <div id="people-tab" class="tab-content" style="display:none">
+        <div class="people-container">
+            <div class="people-grid"></div>
+        </div>
+    </div>
+
     <!-- Video Modal -->
     <div id="videoModal" class="modal" onclick="closeModal(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
@@ -775,6 +841,7 @@ export function generateDailyBriefHTML(
                 <span id="modalTitle"></span>
                 <span id="modalBody"></span>
                 <span id="modalTime"></span>
+                <a id="modalTimeline" class="modal-timeline" href="#" target="scrypted-nvr" style="display:none">View in NVR Timeline \u2192</a>
                 <div id="modalStatus" class="modal-status"></div>
             </div>
         </div>
@@ -820,10 +887,39 @@ export function generateDailyBriefHTML(
             return qs.toString() ? url + '?' + qs.toString() : url;
         }
 
+        // Client-side HTML escaping for dynamic content
+        function esc(s) {
+            var d = document.createElement('div');
+            d.appendChild(document.createTextNode(s));
+            return d.innerHTML.replace(/"/g, '&quot;');
+        }
+
         // Resolve poster thumbnail URLs at runtime using baseUrl
         document.querySelectorAll('img[data-poster-id]').forEach(function(img) {
             var id = img.getAttribute('data-poster-id');
             if (id) img.src = buildUrl('/brief/snapshot', { id: id });
+        });
+
+        // NVR timeline URL builder — swaps plugin path for NVR path
+        // Works for both direct (/endpoint/...) and HA proxy (/api/scrypted/<token>/endpoint/...)
+        function buildNvrTimelineUrl(cameraId, timestamp) {
+            var re = new RegExp('(.*\\/endpoint\\/)[^/]+\\/[^/]+');
+            var nvrBase = baseUrl.replace(re, '$1@scrypted/nvr/public');
+            var clipStart = Number(timestamp) - 5000;
+            return nvrBase + '/#/timeline/' + encodeURIComponent(cameraId) + '?time=' + clipStart;
+        }
+
+        // Event delegation for timeline/highlight items (avoids inline onclick XSS)
+        document.addEventListener('click', function(e) {
+            var item = e.target.closest('[data-event-id]');
+            if (!item) return;
+            var id = item.getAttribute('data-event-id');
+            var title = item.getAttribute('data-event-title');
+            var body = item.getAttribute('data-event-body');
+            var time = item.getAttribute('data-event-time');
+            var cameraId = item.getAttribute('data-camera-id');
+            var timestamp = item.getAttribute('data-timestamp');
+            if (id) openVideoModal(id, title || '', body || '', time || '', cameraId, timestamp);
         });
 
         // Shared VideoPlayer instance
@@ -844,11 +940,20 @@ export function generateDailyBriefHTML(
         var currentBody = null;
         var currentTime = null;
 
-        async function openVideoModal(notificationId, title, body, time) {
+        async function openVideoModal(notificationId, title, body, time, cameraId, timestamp) {
             var modal = document.getElementById('videoModal');
             document.getElementById('modalTitle').textContent = title;
             document.getElementById('modalBody').textContent = body;
             document.getElementById('modalTime').textContent = time;
+
+            // Set NVR timeline link
+            var timelineLink = document.getElementById('modalTimeline');
+            if (timelineLink && cameraId && timestamp) {
+                timelineLink.href = buildNvrTimelineUrl(cameraId, timestamp);
+                timelineLink.style.display = '';
+            } else if (timelineLink) {
+                timelineLink.style.display = 'none';
+            }
 
             currentTitle = title;
             currentBody = body;
@@ -888,7 +993,7 @@ export function generateDailyBriefHTML(
         // Notify parent iframe to lock/unlock height for modal
         function notifyParentModal(state) {
             if (window.parent === window) return;
-            window.parent.postMessage({ type: 'daily-brief-modal', state: state }, '*');
+            window.parent.postMessage({ type: 'daily-brief-modal', state: state }, _parentOrigin || '*');
         }
 
         // Listen for viewport geometry from parent (iframe modal positioning)
@@ -918,7 +1023,7 @@ export function generateDailyBriefHTML(
             try {
                 const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
                 if (tz) {
-                    fetch(baseUrl + '/brief/set-timezone?tz=' + encodeURIComponent(tz));
+                    fetch(baseUrl + '/brief/set-timezone?tz=' + encodeURIComponent(tz), { method: 'POST' });
                 }
             } catch (e) {}
         })();
@@ -1014,8 +1119,8 @@ export function generateDailyBriefHTML(
                                         hour: 'numeric', minute: '2-digit', hour12: true
                                     });
                                 },
-                                onCardClick: function(id, title, body, time) {
-                                    openVideoModal(id, title, body, time);
+                                onCardClick: function(id, title, body, time, cameraId, timestamp) {
+                                    openVideoModal(id, title, body, time, cameraId, timestamp);
                                 }
                             });
                             gallery.init();
@@ -1025,6 +1130,11 @@ export function generateDailyBriefHTML(
                         }
                     }
                 }
+                // Lazy-init people
+                if (target === 'people' && !peopleLoaded) {
+                    peopleLoaded = true;
+                    loadPeople();
+                }
                 // Update URL without reload
                 var url = new URL(window.location);
                 url.searchParams.set('tab', target);
@@ -1032,12 +1142,58 @@ export function generateDailyBriefHTML(
             };
         });
 
-        // Check URL for ?tab=gallery on load
+        document.addEventListener('click', function(e) {
+            var btn = e.target.closest('.person-delete');
+            if (!btn) return;
+            var name = btn.getAttribute('data-person-name');
+            if (!name || !confirm('Delete reference photo for "' + name + '"?')) return;
+            fetch(buildUrl('/brief/people/delete', { name: name }), { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.ok) loadPeople();
+                })
+                .catch(function(err) { console.error('[People] Delete failed:', err); });
+        });
+
+        var peopleLoaded = false;
+        function loadPeople() {
+            var grid = document.querySelector('.people-grid');
+            grid.innerHTML = '<div class="people-empty">Loading...</div>';
+            fetch(buildUrl('/brief/people'))
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (!data.people || data.people.length === 0) {
+                        grid.innerHTML = '<div class="people-empty">No reference photos yet. Enable LLM Person Identification in settings to auto-curate reference photos from face detections.</div>';
+                        return;
+                    }
+                    grid.innerHTML = data.people.map(function(p) {
+                        return '<div class="person-card">'
+                            + '<img src="' + buildUrl('/brief/people/photo', { name: p.name }) + '" alt="' + esc(p.name) + '" loading="lazy">'
+                            + '<div class="person-info">'
+                            + '<div class="person-name">' + esc(p.name) + '</div>'
+                            + '<div class="person-meta">' + (p.faceReferenceScore ? 'Face: ' + p.faceReferenceScore + '/10' : 'Clarity: ' + p.clarityScore + '/10')
+                            + (p.cameraName ? ' &middot; ' + esc(p.cameraName) : '') + '</div>'
+                            + '<button class="person-delete" data-person-name="' + esc(p.name) + '">Delete</button>'
+                            + '</div></div>';
+                    }).join('');
+                })
+                .catch(function(err) {
+                    console.error('[People] Load failed:', err);
+                    grid.innerHTML = '<div class="people-empty">Failed to load reference photos.</div>';
+                    peopleLoaded = false;
+                });
+        }
+
+        // Check URL for ?tab= on load
         (function() {
             var params = new URLSearchParams(window.location.search);
-            if (params.get('tab') === 'gallery') {
+            var tab = params.get('tab');
+            if (tab === 'gallery') {
                 var galleryTab = document.querySelector('.tab[data-tab="gallery"]');
                 if (galleryTab) galleryTab.click();
+            } else if (tab === 'people') {
+                var peopleTab = document.querySelector('.tab[data-tab="people"]');
+                if (peopleTab) peopleTab.click();
             }
         })();
     </script>

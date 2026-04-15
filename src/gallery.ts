@@ -168,6 +168,9 @@ export function getGalleryPage(
         });
     }
 
+    // Sort newest first (storage order may be chronological after JSONL migration)
+    filtered.sort((a, b) => b.timestamp - a.timestamp);
+
     const total = filtered.length;
     const start = (page - 1) * pageSize;
     const paged = filtered.slice(start, start + pageSize);
@@ -182,7 +185,7 @@ export function getGalleryPage(
         names: n.names,
         llmTitle: n.llmTitle,
         llmBody: n.llmBody,
-        thumbnailUrl: (n.hasPoster || n.thumbnailB64) ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+        thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
         hasEmbedding: embeddings ? embeddings.has(n.id) : false,
         groupId: n.groupId,
         groupSize: isDrillDown ? undefined : (n.groupId && groupSizesMap ? groupSizesMap.get(n.groupId) : undefined),
@@ -314,7 +317,7 @@ export async function semanticSearch(
                 names: n.names,
                 llmTitle: n.llmTitle,
                 llmBody: n.llmBody,
-                thumbnailUrl: (n.hasPoster || n.thumbnailB64) ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+                thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
                 hasEmbedding: embeddings.has(n.id),
                 llmIdentifiedName: n.llmIdentifiedName,
                 llmIdentifiedNames: n.llmIdentifiedNames,
@@ -373,7 +376,7 @@ export async function semanticSearch(
             names: n.names,
             llmTitle: n.llmTitle,
             llmBody: n.llmBody,
-            thumbnailUrl: (n.hasPoster || n.thumbnailB64) ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+            thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
             hasEmbedding: true,
             llmIdentifiedName: n.llmIdentifiedName,
             llmIdentifiedNames: n.llmIdentifiedNames,
@@ -395,8 +398,10 @@ export async function handleGalleryDataRequest(
     baseUrl: string,
 ): Promise<{ code: number; body: string; contentType: string }> {
     const urlObj = new URL(url, 'http://localhost');
-    const page = parseInt(urlObj.searchParams.get('page') || '1', 10);
-    const pageSize = Math.min(parseInt(urlObj.searchParams.get('pageSize') || '50', 10), 200);
+    const rawPage = parseInt(urlObj.searchParams.get('page') || '1', 10);
+    const page = isNaN(rawPage) || rawPage < 1 ? 1 : rawPage;
+    const rawPageSize = parseInt(urlObj.searchParams.get('pageSize') || '50', 10);
+    const pageSize = Math.min(Math.max(isNaN(rawPageSize) ? 50 : rawPageSize, 1), 200);
     const camera = urlObj.searchParams.get('camera') || undefined;
     const type = urlObj.searchParams.get('type') || undefined;
     const name = urlObj.searchParams.get('name') || undefined;
@@ -468,7 +473,7 @@ export async function handleGallerySearchRequest(
         names: n.names,
         llmTitle: n.llmTitle,
         llmBody: n.llmBody,
-        thumbnailUrl: (n.hasPoster || n.thumbnailB64) ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+        thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
         hasEmbedding: embeddings.has(n.id),
         llmIdentifiedName: n.llmIdentifiedName,
         llmIdentifiedNames: n.llmIdentifiedNames,
@@ -479,36 +484,6 @@ export async function handleGallerySearchRequest(
         code: 200,
         body: JSON.stringify({ results: mapped, mode: 'keyword', total: mapped.length }),
         contentType: 'application/json',
-    };
-}
-
-export async function handleThumbnailRequest(
-    url: string,
-    store: NotificationStore,
-): Promise<{ code: number; body: Buffer | string; contentType: string; cacheControl?: string }> {
-    const urlObj = new URL(url, 'http://localhost');
-    const id = urlObj.searchParams.get('id') || '';
-
-    if (!id || id.length > 200) {
-        return { code: 400, body: JSON.stringify({ error: 'Invalid id' }), contentType: 'application/json' };
-    }
-
-    const notification = store.getById(id);
-    if (!notification || !notification.thumbnailB64) {
-        return { code: 404, body: JSON.stringify({ error: 'Thumbnail not found' }), contentType: 'application/json' };
-    }
-
-    const jpegBuffer = Buffer.from(notification.thumbnailB64, 'base64');
-
-    // Safety check for oversized thumbnails
-    if (jpegBuffer.length > 1024 * 1024) {
-        return { code: 413, body: JSON.stringify({ error: 'Thumbnail too large' }), contentType: 'application/json' };
-    }
-    return {
-        code: 200,
-        body: jpegBuffer,
-        contentType: 'image/jpeg',
-        cacheControl: 'public, max-age=3600',
     };
 }
 
@@ -525,6 +500,7 @@ export async function handlePeopleRequest(
     const mapped = people.map(p => ({
         name: p.name,
         clarityScore: p.clarityScore,
+        faceReferenceScore: p.faceReferenceScore,
         cameraName: p.cameraName,
         updatedAt: p.updatedAt,
         photoUrl: `${base}/brief/people/photo?name=${encodeURIComponent(p.name)}`,
@@ -559,4 +535,23 @@ export async function handlePeoplePhotoRequest(
         contentType: 'image/jpeg',
         cacheControl: 'public, max-age=3600',
     };
+}
+
+export async function handlePeopleDeleteRequest(
+    url: string,
+    personStore: PersonStore,
+): Promise<{ code: number; body: string; contentType: string }> {
+    const urlObj = new URL(url, 'http://localhost');
+    const name = urlObj.searchParams.get('name') || '';
+
+    if (!name || name.length > 200) {
+        return { code: 400, body: JSON.stringify({ error: 'Invalid name parameter' }), contentType: 'application/json' };
+    }
+
+    const removed = await personStore.remove(name);
+    if (!removed) {
+        return { code: 404, body: JSON.stringify({ error: 'Person not found' }), contentType: 'application/json' };
+    }
+
+    return { code: 200, body: JSON.stringify({ ok: true }), contentType: 'application/json' };
 }

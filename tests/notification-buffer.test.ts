@@ -7,6 +7,7 @@ import {
     NotificationBuffer,
     BufferedNotification,
     DeliveryTarget,
+    MAX_BUFFERED_NOTIFICATIONS,
 } from '../src/notification-buffer';
 
 function makeBuffered(id: string, overrides?: Partial<BufferedNotification>): BufferedNotification {
@@ -259,6 +260,16 @@ describe('NotificationBuffer', () => {
             buffer.add(makeBuffered('n1'), { sendNotification: jest.fn() } as any, {} as any, 'media1');
 
             expect(buffer.size).toBe(1);
+        });
+    });
+
+    describe('buffer capacity limit', () => {
+        it('caps notifications at MAX_BUFFERED_NOTIFICATIONS', () => {
+            const buffer = new NotificationBuffer(60000, jest.fn());
+            for (let i = 0; i < 150; i++) {
+                buffer.add(makeBuffered(`n${i}`), { sendNotification: jest.fn() } as any, {} as any, `media${i}`);
+            }
+            expect(buffer.size).toBeLessThanOrEqual(100);
         });
     });
 });

@@ -124,7 +124,7 @@ export function buildFrozenContext(frozenSegments: FrozenSegment[]): string {
 // Daily Summary LLM Generation
 // ============================================================================
 
-export function createSummaryPrompt(candidates: CandidateWithPriority[], dateStr: string, timezone: string, customInstructions?: string, frozenContext?: string) {
+export function createSummaryPrompt(candidates: CandidateWithPriority[], dateStr: string, timezone: string, customInstructions?: string, frozenContext?: string, periodLabel?: string) {
     // Calculate highlight count: 8-24 highlights based on candidate pool size
     const highlightCount = Math.min(24, Math.max(8, Math.round(candidates.length * 0.3)));
 
@@ -161,18 +161,38 @@ ${frozenContext.trim()}
 </previously_narrated>\n`
         : '';
 
-    const promptText = `You are creating a narrative timeline of security camera events from the past 48 hours.
-${userContextSection}${frozenSection}
-<events>
-${eventList}
-</events>
+    // Per-period context: tells the LLM it's generating for a specific time window
+    const periodSection = periodLabel
+        ? `\n<time_period>
+You are writing about: ${periodLabel}
+All events below fall within this time period. Write a single narrative segment for this period.
+</time_period>\n`
+        : '';
 
-<task>
+    const taskInstructions = periodLabel
+        ? `<task>
+1. Select up to ${highlightCount} events that tell a coherent story
+2. Write a single narrative segment for this time period describing ONLY the selected events
+3. Show JOURNEYS - multiple snapshots of the same person moving through the house IS GOOD
+</task>`
+        : `<task>
 1. Select up to ${highlightCount} events that tell a coherent story
 2. Group into time-based segments (morning, afternoon, evening)
 3. Write a narrative for each segment describing ONLY the selected events
 4. Show JOURNEYS - multiple snapshots of the same person moving through the house IS GOOD
-</task>
+</task>`;
+
+    const timeFraming = periodLabel
+        ? `You are creating a narrative for security camera events during ${periodLabel}.`
+        : `You are creating a narrative timeline of security camera events from the past 48 hours.`;
+
+    const promptText = `${timeFraming}
+${userContextSection}${frozenSection}${periodSection}
+<events>
+${eventList}
+</events>
+
+${taskInstructions}
 
 <output_format>
 {

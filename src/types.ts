@@ -12,6 +12,7 @@ export interface StoredNotification {
     llmTitle: string;
     llmSubtitle: string;
     llmBody: string;
+    /** @deprecated Stripped from memory at load/add. Disk posters are source of truth. */
     thumbnailB64?: string;
     hasPoster?: boolean;           // True when a poster-quality JPEG exists on disk
     detailedDescription?: string;  // Async-generated detailed description for better summaries

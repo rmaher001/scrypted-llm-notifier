@@ -7,7 +7,7 @@ import sdk, {
 } from '@scrypted/sdk';
 const { mediaManager } = sdk;
 import { StoredNotification } from './types';
-import { parseClarity, withTimeout, resizeJpegNearest, getJpegDimensions, buildImageList } from './utils';
+import { parseClarity, withTimeout, resizeJpegNearest, getJpegDimensions, buildImageList, stripJsonFences, FaceReferenceQuality, parseFaceReferenceQuality, cropJpeg } from './utils';
 import { generateEmbedding, GeminiEmbeddingConfig } from './gemini-embedding';
 import type LLMNotifierProvider from './main';
 
@@ -77,17 +77,48 @@ export function extractDetectionData(
 
 
 
-export function shouldLoadReferenceImages(enableLlmFaceId: boolean, detections: any[]): boolean {
-    if (!enableLlmFaceId || !detections || !detections.length) return false;
-    const personCount = detections.filter((d: any) => d.className === 'person').length;
-    const labeledFaceCount = detections.filter((d: any) => d.className === 'face' && d.label).length;
-    return personCount > 0 && personCount > labeledFaceCount;
+export function extractFaceBoundingBox(
+    detections: any[],
+    name: string,
+    minSize = 0,
+): [number, number, number, number] | undefined {
+    for (const det of detections) {
+        if (det.className === 'face' && det.label === name && Array.isArray(det.boundingBox) && det.boundingBox.length >= 4) {
+            const [, , w, h] = det.boundingBox;
+            if (minSize > 0 && (w < minSize || h < minSize)) continue;
+            return det.boundingBox as [number, number, number, number];
+        }
+    }
+    return undefined;
 }
 
-export function shouldCurateReference(enableLlmFaceId: boolean, names: string[], clarityScore: number | undefined, imageUrl: string | undefined): boolean {
+export function shouldLoadReferenceImages(enableLlmFaceId: boolean, detections: any[]): boolean {
+    if (!enableLlmFaceId || !detections || !detections.length) return false;
+    const MIN_FACE_SCORE = 0.7;
+    const unlabeledHighConfFaces = detections.filter((d: any) =>
+        d.className === 'face' && !d.label && (d.score == null || d.score >= MIN_FACE_SCORE)
+    ).length;
+    return unlabeledHighConfFaces > 0;
+}
+
+export function shouldCurateReference(
+    enableLlmFaceId: boolean,
+    names: string[],
+    clarityScore: number | undefined,
+    imageUrl: string | undefined,
+    faceRef?: FaceReferenceQuality | null,
+): boolean {
     if (!enableLlmFaceId || !names.length) return false;
-    if (clarityScore == null || clarityScore < 5) return false;
     if (!imageUrl?.startsWith('data:image/jpeg;base64,')) return false;
+
+    if (faceRef) {
+        if (!faceRef.frontFacing || !faceRef.unobstructed) return false;
+        if (faceRef.score < 7) return false;
+        return true;
+    }
+
+    // Legacy fallback
+    if (clarityScore == null || clarityScore < 5) return false;
     return true;
 }
 
@@ -145,6 +176,36 @@ export function buildNameBadges(
     return badges;
 }
 
+export interface BuildStoredNotificationParams {
+    id: string;
+    detectionEpoch: number;
+    cameraId: string;
+    cameraName: string;
+    detectionType: string;
+    names: string[];
+    enriched: Partial<EnrichmentResult>;
+    hasPoster: boolean;
+    llmIdentifiedNames?: string[];
+}
+
+export function buildStoredNotification(params: BuildStoredNotificationParams): StoredNotification {
+    return {
+        id: params.id,
+        timestamp: params.detectionEpoch,
+        cameraId: params.cameraId,
+        cameraName: params.cameraName,
+        detectionType: params.detectionType,
+        names: params.names,
+        llmTitle: params.enriched.title || '',
+        llmSubtitle: params.enriched.subtitle || '',
+        llmBody: params.enriched.body || '',
+        hasPoster: params.hasPoster,
+        detailedDescription: params.enriched.detailedDescription,
+        clarity: params.enriched.clarity,
+        llmIdentifiedNames: params.llmIdentifiedNames,
+    };
+}
+
 export function buildMetadata(
     title: string,
     subtitle?: string,
@@ -169,6 +230,7 @@ export interface EnrichmentResult {
     identifiedPerson?: string | null;
     identifiedPersonConfidence?: number | null;
     identifiedPersons?: Array<{ name: string; confidence: number }> | null;
+    faceReferenceQuality?: FaceReferenceQuality | null;
 }
 
 export async function callLlm(
@@ -179,7 +241,8 @@ export async function callLlm(
     verbose: boolean = false,
 ): Promise<EnrichmentResult> {
     const start = Date.now();
-    if (verbose) console.log(`Calling LLM (timeout ${timeoutMs}ms)...`);
+    const providerName = (provider as any).name || '(unnamed)';
+    if (verbose) console.log(`Calling LLM ${providerName} (timeout ${timeoutMs}ms)...`);
 
     const llmData = await withTimeout(provider.getChatCompletion(messageTemplate), timeoutMs, 'LLM request');
     const responseTime = Date.now() - start;
@@ -190,7 +253,7 @@ export async function callLlm(
         throw new Error('Empty response from LLM');
     }
 
-    const json = JSON.parse(content);
+    const json = JSON.parse(stripJsonFences(content));
     if (verbose) console.log('LLM response:', json);
 
     // Extract identifiedPersons: prefer new array format, fall back to legacy singular
@@ -211,6 +274,7 @@ export async function callLlm(
         identifiedPerson: json.identifiedPerson ?? null,
         identifiedPersonConfidence: json.identifiedPersonConfidence ?? null,
         identifiedPersons,
+        faceReferenceQuality: parseFaceReferenceQuality(json.faceReferenceQuality, console),
     };
 
     if (typeof result.title !== 'string' || typeof result.subtitle !== 'string' ||
@@ -244,7 +308,7 @@ CRITICAL RULES (DO NOT VIOLATE):
 6. Title format MUST be: "[Person/Object] at [location]"
 7. Some platforms only show title+body - put ALL critical info there
 8. Each field MUST contain different information - no repetition between fields
-9. Response MUST be valid JSON with exactly five fields: title, subtitle, body, detailedDescription, clarity
+9. Response MUST be valid JSON with these fields: title, subtitle, body, detailedDescription, clarity, faceReferenceQuality
 10. If using a person's name in title, use the same name in body - never switch to generic terms
 11. detailedDescription: Write 2-3 detailed sentences focusing on what makes THIS moment unique. Prioritize: specific actions (slicing fruit, opening a box, ironing a shirt), interactions between people, items being carried or used, temporary objects (packages, food, tools), expressions, posture, and anything unusual. Include people's appearance (hair, build, clothing, footwear) and vehicle details (make, model, color, plate) when visible. Briefly note the setting but don't dwell on permanent fixtures — focus more on what is happening than on the room itself. These details power search and daily summaries.
 12. clarity: Assess the image clarity on a 1-10 scale with SPECIFIC criteria:
@@ -253,7 +317,21 @@ CRITICAL RULES (DO NOT VIOLATE):
     - Score 5-6: FAIR - Some details visible but uncertain (probably male, possibly dark clothing)
     - Score 7-8: GOOD - Most details clear (male wearing blue hoodie, carrying backpack)
     - Score 9-10: EXCELLENT - Face features visible, license plates readable, fine details clear
-    Be STRICT and HONEST - if you're guessing what something is, score 5 or below.`;
+    Be STRICT and HONEST - if you're guessing what something is, score 5 or below.
+13. faceReferenceQuality: Assess whether this image would work as a face reference photo for identifying this person in future images. Return null if no person or face is visible. Otherwise:
+    - score (1-10): How suitable is this as a face reference photo? Be VERY STRICT:
+      1-2: No face visible, back of head, too far away
+      3-4: Face barely visible, severe blur, very poor lighting, or looking straight down
+      5: Profile/side view, or face mostly turned away from camera
+      6: Face visible but at an angle (3/4 view), or partially obscured
+      7: Face mostly front-facing but minor issues (slight angle, mediocre lighting, some motion blur)
+      8: Clear front-facing view with good lighting and minimal blur
+      9: Excellent front-facing portrait-quality view, sharp focus, even lighting
+      10: Perfect passport-style photo quality
+      CRITICAL: Profile views, looking down, or turned heads are NEVER above 5. Only score 8+ for truly front-facing, well-lit, sharp faces.
+    - frontFacing: Is the person looking DIRECTLY at or near the camera? Profile views, looking down, looking away = false.
+    - unobstructed: Is the face free of sunglasses, masks, hands covering features, or heavy shadows?
+    - singleSubject: Is there only one prominent person in the image?`;
 
     // Add person identification instructions when reference images are provided
     let personIdPrompt = '';
@@ -277,7 +355,8 @@ Reference photos of known household members are provided below.
     const schema = "CRITICAL CHARACTER LIMITS - STRICTLY ENFORCE:\n- Title: MAXIMUM 32 characters (count every letter, space, punctuation)\n- Subtitle: MAXIMUM 32 characters (count every letter, space, punctuation)\n- Body: MAXIMUM 75 characters (count every letter, space, punctuation)\n- detailedDescription: 2-3 sentences, no strict limit but be concise\n- clarity: object with score (1-10) and reason (brief explanation)\n\nYou MUST count characters before responding. Responses exceeding these limits will be REJECTED and cause system failure. If your description is too long, use shorter words and remove unnecessary details. The body character limit of 75 is ABSOLUTE and NON-NEGOTIABLE.";
 
     // Build user content: reference photos FIRST (static, enables implicit
-    // prefix caching on Gemini/Claude/OpenAI), then dynamic detection content.
+    // prefix caching on Gemini/Claude/OpenAI), then detection images, then metadata text.
+    // Images before text improves visual grounding on Gemma 4 and other VLMs.
     const userContent: any[] = [];
 
     // 1. Reference photos (identical across requests — cacheable prefix)
@@ -289,14 +368,16 @@ Reference photos of known household members are provided below.
         }
     }
 
-    // 2. Dynamic content (changes every request)
+    // 2. Detection images (before metadata text for better vision grounding)
+    for (const url of imageUrls) {
+        userContent.push({ type: 'image_url', image_url: { url } });
+    }
+
+    // 3. Metadata text (after images)
     userContent.push({
         type: 'text',
         text: `Original notification metadata: ${JSON.stringify(metadata, null, 2)}`,
     });
-    for (const url of imageUrls) {
-        userContent.push({ type: 'image_url', image_url: { url } });
-    }
 
     // Build JSON schema — include identifiedPerson when reference images provided
     const schemaProperties: any = {
@@ -314,7 +395,23 @@ Reference photos of known household members are provided below.
             additionalProperties: false
         }
     };
-    const requiredFields = ["title", "subtitle", "body", "detailedDescription", "clarity"];
+    schemaProperties.faceReferenceQuality = {
+        anyOf: [
+            {
+                type: "object",
+                properties: {
+                    score: { type: "number" },
+                    frontFacing: { type: "boolean" },
+                    unobstructed: { type: "boolean" },
+                    singleSubject: { type: "boolean" },
+                },
+                required: ["score", "frontFacing", "unobstructed", "singleSubject"],
+                additionalProperties: false,
+            },
+            { type: "null" },
+        ],
+    };
+    const requiredFields = ["title", "subtitle", "body", "detailedDescription", "clarity", "faceReferenceQuality"];
 
     if (referenceImages && referenceImages.size > 0) {
         schemaProperties.identifiedPersons = {
@@ -338,6 +435,7 @@ Reference photos of known household members are provided below.
     }
 
     return {
+        temperature: 0.1,
         messages: [
             {
                 role: "system",
@@ -373,7 +471,8 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
     };
 
     async sendNotification(title: string, options?: NotifierOptions, media?: string | MediaObject, icon?: string | MediaObject) {
-        const timestamp = new Date().toISOString();
+        const detectionEpoch = Date.now();
+        const timestamp = new Date(detectionEpoch).toISOString();
         let imageSizeKB: number | undefined;
         const verbose = !!(this.llmProvider.storageSettings.values as any).verboseLogging;
 
@@ -408,8 +507,9 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
             imageSizeKB = Math.round(buffer.length / 1024);
         }
 
-        // Always fetch full-frame snapshot for THIS EVENT (used for poster cache + optionally LLM)
+        // Always fetch full-frame snapshot for THIS EVENT (used for poster cache + face crop)
         // snapshotMode only controls what gets sent to the LLM, not the poster cache
+        let fullFrameBuf: Buffer | undefined;
         try {
             const re = (options as any)?.recordedEvent;
             const data = re?.data || {};
@@ -421,8 +521,8 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
                 const objDet = sdk.systemManager.getDeviceById(sourceId) as any;
                 if (objDet?.getDetectionInput) {
                     const fullMo = await objDet.getDetectionInput(detectionId, re?.eventId);
-                    const fullBuf = await mediaManager.convertMediaObjectToBuffer(fullMo, 'image/jpeg');
-                    fullFrameUrl = await processFullFrame(fullBuf, this.console);
+                    fullFrameBuf = await mediaManager.convertMediaObjectToBuffer(fullMo, 'image/jpeg');
+                    fullFrameUrl = await processFullFrame(fullFrameBuf, this.console);
                 }
             }
         } catch (e) {
@@ -471,6 +571,7 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
                 this.console.warn('[PersonID] Failed to load reference images:', e);
             }
         }
+
 
         const messageTemplate = createMessageTemplate(
             this.llmProvider.storageSettings.values.userPrompt,
@@ -527,7 +628,7 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
 
                         const llmPromise = (async () => {
                             try {
-                                const result = await callLlm(this.llmProvider.selectProvider(), messageTemplate, llmTimeout, this.console, verbose);
+                                const result = await callLlm(this.llmProvider.selectNotificationProvider(), messageTemplate, llmTimeout, this.console, verbose);
                                 this.llmProvider.responseCache.set(cacheKey, result);
                                 if (verbose) this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
                                 return result;
@@ -543,7 +644,7 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
             } else {
                 if (verbose) this.console.log(`⚠️  No detectionId, skipping cache`);
                 shouldStore = true;
-                enriched = await callLlm(this.llmProvider.selectProvider(), messageTemplate, llmTimeout, this.console, verbose);
+                enriched = await callLlm(this.llmProvider.selectNotificationProvider(), messageTemplate, llmTimeout, this.console, verbose);
                 if (verbose) this.console.log(`[${timestamp}] 📊 LLM Notification processed - Mode: ${snapshotMode}, Cropped: ${imageSizeKB || 'N/A'}KB, Total: ${this.notificationStats.total} (With: ${this.notificationStats.withSnapshot}, Without: ${this.notificationStats.withoutSnapshot})`);
             }
 
@@ -568,17 +669,30 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
 
                 const { detectionType, names: baseNames } = extractDetectionData(detections, title, options?.body);
 
-                // Curate reference photo from identified face detections (cropped image = tighter subject crop)
+                // Curate reference photo — crop face from full frame when bbox available
                 const clarityScore = enriched.clarity?.score;
-                if (shouldCurateReference(enableFaceId, baseNames, clarityScore, imageUrl)) {
+                const faceRef = enriched.faceReferenceQuality;
+                if (shouldCurateReference(enableFaceId, baseNames, clarityScore, imageUrl, faceRef)) {
                     for (const name of baseNames) {
                         try {
-                            const cropBuf = Buffer.from(imageUrl.replace('data:image/jpeg;base64,', ''), 'base64');
+                            const faceBbox = extractFaceBoundingBox(detections, name, 50);
+                            if (!faceBbox || !fullFrameBuf) {
+                                if (verbose) this.console.log(`[PersonID] Skipping "${name}" — no face bbox or full frame available`);
+                                continue;
+                            }
+                            let cropBuf: Buffer;
+                            try {
+                                cropBuf = cropJpeg(fullFrameBuf, faceBbox, 0.5);
+                                if (verbose) this.console.log(`[PersonID] Cropped face for "${name}" from full frame (bbox: ${faceBbox.join(',')})`);
+                            } catch (cropErr) {
+                                this.console.warn(`[PersonID] Face crop failed for "${name}", skipping:`, cropErr);
+                                continue;
+                            }
                             const stored = await this.llmProvider.personStore.curate(
-                                name, cropBuf, clarityScore!, cameraName
+                                name, cropBuf, clarityScore ?? 0, cameraName, faceRef?.score
                             );
                             if (stored) {
-                                this.console.log(`[PersonID] Updated reference for "${name}" (clarity: ${clarityScore})`);
+                                this.console.log(`[PersonID] Updated reference for "${name}" (faceRef: ${faceRef?.score ?? 'n/a'}, clarity: ${clarityScore})`);
                             }
                         } catch (e) {
                             this.console.warn(`[PersonID] Failed to curate reference for "${name}":`, e);
@@ -604,27 +718,10 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
                 if (!cameraId) {
                     this.console.warn(`[Storage] No cameraId from media.sourceId, skipping storage for "${title}"`);
                 } else {
-                    // Create small thumbnail for storage (max 100KB)
-                    let thumbnailB64: string | undefined;
-                    if (imageUrl && imageUrl.startsWith('data:image/jpeg;base64,')) {
-                        const b64Data = imageUrl.replace('data:image/jpeg;base64,', '');
-                        const buf = Buffer.from(b64Data, 'base64');
-                        if (buf.length < 100 * 1024) {
-                            thumbnailB64 = b64Data;
-                        } else {
-                            // Resize to smaller thumbnail
-                            try {
-                                const resized = await resizeJpegNearest(buf, 200, 50);
-                                thumbnailB64 = resized.toString('base64');
-                            } catch {
-                                // Skip thumbnail if resize fails
-                            }
-                        }
-                    }
-
                     // Persist poster-quality JPEG to disk before storing notification
                     const posterUrl = fullFrameUrl || imageUrl;
                     let hasPosterFlag = false;
+                    if (verbose) this.console.log(`[Poster] posterUrl present: ${!!posterUrl}, starts with data:image: ${posterUrl?.startsWith('data:image/jpeg;base64,') ?? false}, fullFrameUrl: ${!!fullFrameUrl}, imageUrl: ${!!imageUrl}`);
                     if (posterUrl?.startsWith('data:image/jpeg;base64,')) {
                         const posterBuf = Buffer.from(posterUrl.replace('data:image/jpeg;base64,', ''), 'base64');
                         if (posterBuf.length <= 500 * 1024) {
@@ -637,22 +734,17 @@ export class LLMNotifier extends MixinDeviceBase<Notifier> implements Notifier {
                         }
                     }
 
-                    const storedNotification: StoredNotification = {
+                    const storedNotification = buildStoredNotification({
                         id: notificationId,
-                        timestamp: Date.now(),
+                        detectionEpoch,
                         cameraId,
                         cameraName: cameraName || 'Unknown Camera',
                         detectionType,
                         names,
-                        llmTitle: enriched.title,
-                        llmSubtitle: enriched.subtitle,
-                        llmBody: enriched.body,
-                        thumbnailB64,
+                        enriched,
                         hasPoster: hasPosterFlag,
-                        detailedDescription: enriched.detailedDescription,
-                        clarity: enriched.clarity,
                         llmIdentifiedNames: acceptedLlmNames.length > 0 ? acceptedLlmNames : undefined,
-                    };
+                    });
                     this.llmProvider.notificationStore.add(storedNotification);
 
                     // Store Gemini multimodal embedding if API key configured

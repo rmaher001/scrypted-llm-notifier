@@ -30,6 +30,37 @@ function makeStorage(): any {
     };
 }
 
+describe('NotificationStore.onAdd', () => {
+    let store: NotificationStore;
+
+    beforeEach(() => {
+        store = new NotificationStore(makeStorage());
+    });
+
+    it('fires listener when a notification is added', () => {
+        const fn = jest.fn();
+        store.onAdd(fn);
+        store.add(makeNotification('n1'));
+        expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fire on duplicate add', () => {
+        store.add(makeNotification('n1'));
+        const fn = jest.fn();
+        store.onAdd(fn);
+        store.add(makeNotification('n1'));
+        expect(fn).not.toHaveBeenCalled();
+    });
+
+    it('unsubscribe stops listener from firing', () => {
+        const fn = jest.fn();
+        const unsub = store.onAdd(fn);
+        unsub();
+        store.add(makeNotification('n1'));
+        expect(fn).not.toHaveBeenCalled();
+    });
+});
+
 describe('NotificationStore.updateGroup', () => {
     let store: NotificationStore;
     let storage: any;

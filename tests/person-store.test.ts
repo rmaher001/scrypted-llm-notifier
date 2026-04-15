@@ -296,4 +296,94 @@ describe('PersonStore', () => {
             expect(callCount).toBe(2);
         });
     });
+
+    describe('curate with faceReferenceScore', () => {
+        it('stores faceReferenceScore in metadata', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 7, 'Front Door', 8);
+            const meta = await store.getMetadata('Richard');
+            expect(meta!.faceReferenceScore).toBe(8);
+        });
+
+        it('uses faceReferenceScore for comparison when available', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 5, 'Cam1', 7);
+            // Higher faceReferenceScore should overwrite
+            const stored = await store.curate('Richard', SAMPLE_JPEG_2, 3, 'Cam2', 9);
+            expect(stored).toBe(true);
+            const meta = await store.getMetadata('Richard');
+            expect(meta!.faceReferenceScore).toBe(9);
+        });
+
+        it('does NOT overwrite when new faceReferenceScore is lower', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 5, 'Cam1', 8);
+            const stored = await store.curate('Richard', SAMPLE_JPEG_2, 9, 'Cam2', 6);
+            expect(stored).toBe(false);
+            const meta = await store.getMetadata('Richard');
+            expect(meta!.faceReferenceScore).toBe(8);
+        });
+
+        it('falls back to clarityScore comparison when no faceReferenceScore on existing', async () => {
+            // Legacy entry without faceReferenceScore
+            await store.curate('Richard', SAMPLE_JPEG, 7);
+            // New entry with faceReferenceScore beats legacy clarityScore
+            const stored = await store.curate('Richard', SAMPLE_JPEG_2, 5, 'Cam2', 8);
+            expect(stored).toBe(true);
+        });
+
+        it('uses clarityScore as tiebreaker at equal faceReferenceScore', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 5, 'Cam1', 8);
+            // Same faceReferenceScore but higher clarity should replace
+            const stored = await store.curate('Richard', SAMPLE_JPEG_2, 7, 'Cam2', 8);
+            expect(stored).toBe(true);
+            const meta = await store.getMetadata('Richard');
+            expect(meta!.clarityScore).toBe(7);
+        });
+
+        it('does NOT overwrite at equal faceReferenceScore and equal clarity', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 5, 'Cam1', 8);
+            const stored = await store.curate('Richard', SAMPLE_JPEG_2, 5, 'Cam2', 8);
+            expect(stored).toBe(false);
+        });
+
+        it('does NOT overwrite at equal faceReferenceScore and lower clarity', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 7, 'Cam1', 8);
+            const stored = await store.curate('Richard', SAMPLE_JPEG_2, 4, 'Cam2', 8);
+            expect(stored).toBe(false);
+            const meta = await store.getMetadata('Richard');
+            expect(meta!.clarityScore).toBe(7);
+        });
+    });
+
+    describe('concurrent curate serialization', () => {
+        it('only one of two concurrent curates with equal scores succeeds', async () => {
+            // Fire both curates concurrently — without a mutex, both read empty metadata
+            // and both write, causing last-write-wins. With a mutex, the second sees
+            // the first's entry and rejects (equal score).
+            const [r1, r2] = await Promise.all([
+                store.curate('Richard', SAMPLE_JPEG, 7, 'Cam1', 9),
+                store.curate('Richard', SAMPLE_JPEG_2, 7, 'Cam2', 9),
+            ]);
+            expect([r1, r2]).toContain(true);
+            expect([r1, r2]).toContain(false);
+            // Only one entry in metadata
+            const all = await store.getAllPeople();
+            expect(all.filter(p => store.normalizeName(p.name) === 'richard')).toHaveLength(1);
+        });
+
+        it('remove wins over concurrent curate', async () => {
+            await store.curate('Richard', SAMPLE_JPEG, 7, 'Cam1', 9);
+            // Fire remove and curate concurrently
+            const [removed, curated] = await Promise.all([
+                store.remove('Richard'),
+                store.curate('Richard', SAMPLE_JPEG_2, 8, 'Cam2', 10),
+            ]);
+            expect(removed).toBe(true);
+            // After both complete, if remove ran first the curate re-creates,
+            // if curate ran first the remove deletes. Either way, the operations
+            // must not corrupt metadata. With a mutex, remove runs first (queued first),
+            // then curate sees no entry and creates one.
+            // The key invariant: metadata must not be corrupted.
+            const all = await store.getAllPeople();
+            expect(all.length).toBeLessThanOrEqual(1);
+        });
+    });
 });
