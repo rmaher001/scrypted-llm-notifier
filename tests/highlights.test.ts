@@ -21,15 +21,15 @@ function makeCandidate(id: string, overrides?: Partial<StoredNotification>): Can
 
 describe('buildCachedHighlights name fields', () => {
     it('includes names from StoredNotification', () => {
-        const candidates = [makeCandidate('n1', { names: ['Richard', 'Olesia'] })];
+        const candidates = [makeCandidate('n1', { names: ['Alex', 'Blake'] })];
         const highlights = buildCachedHighlights(candidates, ['n1'], 'America/Los_Angeles');
-        expect(highlights[0].names).toEqual(['Richard', 'Olesia']);
+        expect(highlights[0].names).toEqual(['Alex', 'Blake']);
     });
 
     it('includes llmIdentifiedName from StoredNotification', () => {
-        const candidates = [makeCandidate('n1', { llmIdentifiedName: 'Richard' })];
+        const candidates = [makeCandidate('n1', { llmIdentifiedName: 'Alex' })];
         const highlights = buildCachedHighlights(candidates, ['n1'], 'America/Los_Angeles');
-        expect(highlights[0].llmIdentifiedName).toBe('Richard');
+        expect(highlights[0].llmIdentifiedName).toBe('Alex');
     });
 
     it('returns undefined names when notification has empty names array', () => {
@@ -45,9 +45,9 @@ describe('buildCachedHighlights name fields', () => {
     });
 
     it('includes llmIdentifiedNames array from StoredNotification', () => {
-        const candidates = [makeCandidate('n1', { llmIdentifiedNames: ['Richard', 'Olesia'] })];
+        const candidates = [makeCandidate('n1', { llmIdentifiedNames: ['Alex', 'Blake'] })];
         const highlights = buildCachedHighlights(candidates, ['n1'], 'America/Los_Angeles');
-        expect(highlights[0].llmIdentifiedNames).toEqual(['Richard', 'Olesia']);
+        expect(highlights[0].llmIdentifiedNames).toEqual(['Alex', 'Blake']);
     });
 
     it('returns undefined llmIdentifiedNames when not set on notification', () => {

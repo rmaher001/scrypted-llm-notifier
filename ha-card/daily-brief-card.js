@@ -4,7 +4,7 @@
  * All rendering (timeline, gallery, video, badges) is handled by the web UI.
  */
 
-const CARD_VERSION = '0.3.71';
+const CARD_VERSION = '0.3.187';
 
 class DailyBriefCard extends HTMLElement {
   constructor() {
@@ -13,6 +13,8 @@ class DailyBriefCard extends HTMLElement {
     this._config = {};
     this._iframeOrigin = null;
     this._boundOnMessage = this._onMessage.bind(this);
+    this._lastDeepLinkId = null;
+    this._lastDeepLinkGroupId = null;
   }
 
   set hass(hass) {
@@ -40,10 +42,34 @@ class DailyBriefCard extends HTMLElement {
 
   connectedCallback() {
     window.addEventListener('message', this._boundOnMessage);
+    // HA may navigate the dashboard URL (notification tap → ?groupId=)
+    // without re-instantiating the card, so re-render the iframe when the
+    // URL changes to pick up the new deep-link params.
+    this._boundOnUrlChange = this._onUrlChange.bind(this);
+    window.addEventListener('popstate', this._boundOnUrlChange);
+    window.addEventListener('hashchange', this._boundOnUrlChange);
+    window.addEventListener('location-changed', this._boundOnUrlChange);
   }
 
   disconnectedCallback() {
     window.removeEventListener('message', this._boundOnMessage);
+    if (this._boundOnUrlChange) {
+      window.removeEventListener('popstate', this._boundOnUrlChange);
+      window.removeEventListener('hashchange', this._boundOnUrlChange);
+      window.removeEventListener('location-changed', this._boundOnUrlChange);
+    }
+  }
+
+  _onUrlChange() {
+    if (!this._config || !this._config.endpoint) return;
+    // Only re-render if our deep-link params actually changed; HA fires
+    // popstate / location-changed on every internal nav, and we don't want
+    // to thrash the iframe.
+    var p = this._readDeepLinkParams();
+    if (p.id === this._lastDeepLinkId && p.groupId === this._lastDeepLinkGroupId) return;
+    this._lastDeepLinkId = p.id;
+    this._lastDeepLinkGroupId = p.groupId;
+    this._render();
   }
 
   _onMessage(event) {
@@ -69,6 +95,53 @@ class DailyBriefCard extends HTMLElement {
         this._modalOpen = false;
       }
     }
+
+    // NVR timeline open. kind:'cloud' (default for back-compat) ->
+    // window.open with named target so Mac reuses the same browser tab
+    // (iOS still spawns a new tab — OS-level constraint we accept).
+    // kind:'ha' -> in-app HA navigation via history.pushState +
+    // 'location-changed' event; same-origin so iOS HA Companion stays
+    // in-app and the named target / new-tab issue doesn't apply.
+    if (event.data && event.data.type === 'daily-brief-open-nvr' && typeof event.data.url === 'string') {
+      var url = event.data.url;
+      var kind = event.data.kind || 'cloud';
+      if (kind === 'ha') {
+        // pushState throws SecurityError if `url` is cross-origin to the
+        // current document. The HA-route URL should always be a same-origin
+        // path (e.g. /scrypted?camera=...) but if the iframe ever sends an
+        // absolute URL with a different origin, fall back to window.open
+        // so the user still gets to the URL rather than failing silently.
+        try {
+          window.history.pushState(null, '', url);
+          window.dispatchEvent(new Event('location-changed'));
+        } catch (e) {
+          try { window.open(url, 'scrypted-nvr'); } catch (e2) { /* popup blocked */ }
+        }
+      } else {
+        try { window.open(url, 'scrypted-nvr'); } catch (e) { /* popup blocked */ }
+      }
+    }
+  }
+
+  _readDeepLinkParams() {
+    // HA's frontend routes by path and may emit query params either on
+    // location.search or on location.hash (e.g., '#/lovelace?groupId=x').
+    // Read both, prefer search, fall back to hash. Best-effort.
+    var ids = { id: null, groupId: null };
+    try {
+      var s = new URLSearchParams(window.location.search);
+      ids.id = s.get('id');
+      ids.groupId = s.get('groupId');
+      if (!ids.id && !ids.groupId && window.location.hash) {
+        var h = window.location.hash.indexOf('?');
+        if (h >= 0) {
+          var hs = new URLSearchParams(window.location.hash.slice(h + 1));
+          ids.id = hs.get('id');
+          ids.groupId = hs.get('groupId');
+        }
+      }
+    } catch (e) { /* best-effort */ }
+    return ids;
   }
 
   _render() {
@@ -79,6 +152,17 @@ class DailyBriefCard extends HTMLElement {
       iframeUrl.pathname = iframeUrl.pathname.replace(/\/$/, '') + '/brief';
       iframeUrl.searchParams.set('scryptedToken', this._config.scrypted_token);
       iframeUrl.searchParams.set('v', CARD_VERSION);
+      var deepLink = this._readDeepLinkParams();
+      if (deepLink.id) iframeUrl.searchParams.set('id', deepLink.id);
+      if (deepLink.groupId) iframeUrl.searchParams.set('groupId', deepLink.groupId);
+      this._lastDeepLinkId = deepLink.id;
+      this._lastDeepLinkGroupId = deepLink.groupId;
+      try {
+        var logUrl = new URL(iframeUrl.toString());
+        logUrl.searchParams.set('scryptedToken', '[redacted]');
+        console.log('[daily-brief-card] iframe URL:', logUrl.toString(),
+          'parent search:', window.location.search, 'hash:', window.location.hash);
+      } catch (e) { /* logging is best-effort */ }
     } catch (e) {
       this._renderError('Invalid endpoint URL: ' + this._config.endpoint);
       return;

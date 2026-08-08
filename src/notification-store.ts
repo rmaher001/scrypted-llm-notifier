@@ -16,12 +16,66 @@ export interface EmbeddingEntry {
     dimension: number;
 }
 
+/** The YYYY-MM-DD a UTC instant falls on, as read in `timeZone`. */
+function localDateKey(instant: number, timeZone: string): string {
+    return new Date(instant).toLocaleDateString('en-CA', { timeZone });
+}
+
+/**
+ * The first instant belonging to the given YYYY-MM-DD in `timeZone`.
+ *
+ * Found by binary search for the boundary where the local calendar date first
+ * reaches `dateKey`, rather than by computing an offset and subtracting it.
+ * Offset arithmetic has no single correct form: where the DST change lands at
+ * midnight, applying the offset taken at 00:00 UTC is right for America/Santiago
+ * but wrong for Asia/Beirut, and applying the refined offset is the reverse.
+ * Searching for the boundary is correct in both, and also returns 01:00 local on
+ * spring-forward days where midnight does not exist at all.
+ *
+ * Bounds are +/-26h around the naive UTC date, comfortably outside the +/-14h
+ * range of real zone offsets, so the invariant
+ * `localDateKey(lo) < dateKey <= localDateKey(hi)` always holds. ~28 iterations.
+ */
+function zonedDayStartMs(dateKey: string, timeZone: string): number {
+    const [y, m, d] = dateKey.split('-').map(Number);
+    const approx = Date.UTC(y, m - 1, d);
+    let lo = approx - 26 * 3600_000;
+    let hi = approx + 26 * 3600_000;
+    while (hi - lo > 1) {
+        const mid = lo + Math.floor((hi - lo) / 2);
+        if (localDateKey(mid, timeZone) < dateKey) lo = mid;
+        else hi = mid;
+    }
+    return hi;
+}
+
+/**
+ * Inclusive [start, end] of the calendar day containing `date`, in `timeZone`.
+ * The end is derived from the NEXT day's midnight rather than by adding 24h,
+ * so 23- and 25-hour DST days are covered exactly.
+ */
+export function dayBoundsMs(date: Date, timeZone?: string): { start: number; end: number } {
+    if (!timeZone) {
+        const start = new Date(date); start.setHours(0, 0, 0, 0);
+        const end = new Date(date); end.setHours(23, 59, 59, 999);
+        return { start: start.getTime(), end: end.getTime() };
+    }
+    const key = localDateKey(date.getTime(), timeZone);
+    const start = zonedDayStartMs(key, timeZone);
+    // End comes from the NEXT day's start, so 23- and 25-hour DST days are
+    // exact rather than assumed to be 24h.
+    const nextKey = localDateKey(start + 36 * 3600_000, timeZone);
+    return { start, end: zonedDayStartMs(nextKey, timeZone) - 1 };
+}
+
 export class NotificationStore {
     private notifications: StoredNotification[] = [];
     private summaryCache: Map<string, CachedSummary> = new Map();
     private embeddings: Map<string, { embedding: string; dimension: number }> = new Map();
     private storage: any;
     private retentionDays = 3;
+    private timezone: string | undefined;
+    private maxPerDay = 2000;
     private getFilesPath?: () => Promise<string>;
     private notifLog?: NotificationLog<StoredNotification>;
     private embeddingLog?: NotificationLog<EmbeddingEntry>;
@@ -89,6 +143,20 @@ export class NotificationStore {
 
     setRetentionDays(days: number) {
         this.retentionDays = isNaN(days) ? 3 : Math.max(1, Math.floor(days));
+    }
+
+    /**
+     * The zone prune() buckets by for its per-day cap. Without it the cap uses
+     * UTC calendar dates, which on a UTC server splits one local day across two
+     * buckets and shares one bucket between two local days.
+     */
+    setTimezone(timezone: string | undefined) {
+        this.timezone = timezone || undefined;
+    }
+
+    /** Per-day cap for prune(). Exposed so tests need not build 2000 records. */
+    setMaxPerDay(max: number) {
+        this.maxPerDay = Math.max(1, Math.floor(max));
     }
 
     // Immediately evict stale notifications (e.g. after reducing retentionDays)
@@ -228,7 +296,6 @@ export class NotificationStore {
     private prune() {
         const now = Date.now();
         const maxAge = this.retentionDays * 24 * 60 * 60 * 1000;
-        const maxPerDay = 2000;
 
         // Step 1: Remove items older than retention window
         this.notifications = this.notifications.filter(n => now - n.timestamp < maxAge);
@@ -236,7 +303,11 @@ export class NotificationStore {
         // Step 2: Group by day and keep only maxPerDay per day (newest first)
         const byDay = new Map<string, StoredNotification[]>();
         for (const n of this.notifications) {
-            const day = new Date(n.timestamp).toISOString().split('T')[0];
+            // Bucket by the user's calendar day. UTC dates split one local day
+            // in two on a UTC server, so the cap evicted the wrong records.
+            const day = this.timezone
+                ? localDateKey(n.timestamp, this.timezone)
+                : new Date(n.timestamp).toISOString().split('T')[0];
             if (!byDay.has(day)) byDay.set(day, []);
             byDay.get(day)!.push(n);
         }
@@ -245,7 +316,7 @@ export class NotificationStore {
         this.notifications = [];
         for (const [, dayNotifications] of byDay) {
             dayNotifications.sort((a, b) => b.timestamp - a.timestamp);
-            this.notifications.push(...dayNotifications.slice(0, maxPerDay));
+            this.notifications.push(...dayNotifications.slice(0, this.maxPerDay));
         }
 
         // Sort final result by timestamp descending
@@ -288,14 +359,24 @@ export class NotificationStore {
         console.log(`[Daily Brief] Cleared ${count} notifications`);
     }
 
-    getForDate(date: Date): StoredNotification[] {
-        const startOfDay = new Date(date);
-        startOfDay.setHours(0, 0, 0, 0);
-        const endOfDay = new Date(date);
-        endOfDay.setHours(23, 59, 59, 999);
-
+    /**
+     * Notifications belonging to the calendar day that contains `date`, as
+     * measured in `timezone`.
+     *
+     * Scrypted runs UTC, so `setHours(0,0,0,0)` — the old implementation —
+     * started the day at 00:00 UTC, which is the previous afternoon or evening
+     * for anyone west of Greenwich. That both over-counted (the whole previous
+     * evening landed in "today") and under-counted (this evening's events fell
+     * into "tomorrow" once UTC rolled over). Every other day boundary in the
+     * plugin is timezone-aware; this one is now too.
+     *
+     * Omitting `timezone` keeps the old server-local behavior, for callers that
+     * genuinely have no user timezone to honor.
+     */
+    getForDate(date: Date, timezone?: string): StoredNotification[] {
+        const { start, end } = dayBoundsMs(date, timezone);
         return this.notifications.filter(n =>
-            n.timestamp >= startOfDay.getTime() && n.timestamp <= endOfDay.getTime()
+            n.timestamp >= start && n.timestamp <= end
         ).sort((a, b) => b.timestamp - a.timestamp);
     }
 
@@ -306,8 +387,8 @@ export class NotificationStore {
         ).sort((a, b) => b.timestamp - a.timestamp);
     }
 
-    getStats(date: Date): DailyStats {
-        const notifications = this.getForDate(date);
+    getStats(date: Date, timezone?: string): DailyStats {
+        const notifications = this.getForDate(date, timezone);
         const stats: DailyStats = {
             total: notifications.length,
             byType: {},
@@ -351,29 +432,39 @@ export class NotificationStore {
         return this.notifications.find(n => n.id === id);
     }
 
-    getByGroupId(groupId: string): StoredNotification[] {
-        if (!groupId) return [];
-        return this.notifications.filter(n => n.groupId === groupId);
-    }
-
-    // Update group metadata for a set of notification IDs
-    updateGroup(notificationIds: string[], groupId: string, primaryId: string): void {
-        const idSet = new Set(notificationIds);
-        const updated: StoredNotification[] = [];
+    /**
+     * One-shot migration: strip the v0.3.83-v0.3.116 grouping fields
+     * (groupId, isGroupPrimary, llmGroupTitle, llmGroupSubtitle, llmGroupBody)
+     * from all in-memory records and rewrite the JSONL log. Called once at
+     * plugin startup after the stories-grouping replacement landed; safe to
+     * run multiple times (idempotent).
+     *
+     * Returns the number of records modified (0 if no records had any of
+     * the legacy fields).
+     */
+    stripLegacyGroupFields(): number {
+        let modified = 0;
         for (const n of this.notifications) {
-            if (idSet.has(n.id)) {
-                n.groupId = groupId;
-                n.isGroupPrimary = (n.id === primaryId);
-                updated.push(n);
+            const r = n as any;
+            if (r.groupId !== undefined || r.isGroupPrimary !== undefined
+                || r.llmGroupTitle !== undefined || r.llmGroupSubtitle !== undefined
+                || r.llmGroupBody !== undefined) {
+                delete r.groupId;
+                delete r.isGroupPrimary;
+                delete r.llmGroupTitle;
+                delete r.llmGroupSubtitle;
+                delete r.llmGroupBody;
+                modified++;
             }
         }
-        if (this.diskReady && this.notifLog) {
-            for (const n of updated) {
-                this.notifLog.appendSync(n);
+        if (modified > 0) {
+            if (this.diskReady && this.notifLog) {
+                this.notifLog.compactSync(this.notifications);
+            } else {
+                this.save();
             }
-        } else {
-            this.save();
         }
+        return modified;
     }
 
     // Mark a notification as having a poster on disk (for NVR backfill)

@@ -24,6 +24,7 @@ export function buildCachedHighlights(
             cameraId: n.cameraId,
             cameraName: n.cameraName,
             timestamp: n.timestamp,
+            seekTimestamp: n.seekTimestamp,
             date: new Date(n.timestamp).toLocaleDateString('en-US', {
                 month: 'long',
                 day: 'numeric',

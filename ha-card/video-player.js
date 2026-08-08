@@ -25,6 +25,9 @@ class VideoPlayer {
 
     this._currentPC = null;
     this._currentNotificationId = null;
+    // Normalized clip ref: { id } for a notification, or { cameraId, time,
+    // posterUrl } for a Story (which has no notificationId).
+    this._currentRef = null;
 
     // Stall detector state
     this._stallLastFrameTime = 0;
@@ -98,9 +101,31 @@ class VideoPlayer {
 
   // ---- WebRTC ----
 
-  async _tryWebRTC(notificationId) {
-    if (!notificationId) {
-      console.log(this._logPrefix, 'No notification ID, skipping WebRTC');
+  // Build the query params that identify the clip for /brief/video and
+  // /brief/snapshot — cameraId+time for a Story, else the notification id.
+  _clipParams() {
+    var r = this._currentRef || {};
+    if (r.cameraId && r.time != null) return { cameraId: r.cameraId, time: r.time };
+    return { id: r.id };
+  }
+
+  // Build the /brief/webrtc-signal POST body for the current clip ref.
+  _signalBody(offer) {
+    var r = this._currentRef || {};
+    if (r.cameraId && r.time != null) {
+      return { cameraId: r.cameraId, time: r.time, offer: offer };
+    }
+    return { notificationId: r.id, offer: offer };
+  }
+
+  _hasRef() {
+    var r = this._currentRef || {};
+    return !!(r.id || (r.cameraId && r.time != null));
+  }
+
+  async _tryWebRTC() {
+    if (!this._hasRef()) {
+      console.log(this._logPrefix, 'No clip ref, skipping WebRTC');
       return false;
     }
 
@@ -109,7 +134,7 @@ class VideoPlayer {
     var self = this;
 
     try {
-      console.log(this._logPrefix, 'Starting WebRTC for notification:', notificationId);
+      console.log(this._logPrefix, 'Starting WebRTC for clip:', JSON.stringify(this._clipParams()));
 
       var pc = new RTCPeerConnection({
         iceServers: [
@@ -153,10 +178,17 @@ class VideoPlayer {
       };
 
       video.onplaying = function() {
-        video.classList.remove('loading');
-        poster.style.display = 'none';
-        self._statusFn('');
-        self.startStallDetector();
+        // Defer by two paint frames so the first video frame is on-screen
+        // before we drop visibility — without this gap iOS shows its
+        // loading-dim overlay between `playing` firing and first paint.
+        requestAnimationFrame(function() {
+          requestAnimationFrame(function() {
+            video.classList.remove('loading');
+            poster.style.display = 'none';
+            self._statusFn('');
+            self.startStallDetector();
+          });
+        });
       };
 
       var offer = await pc.createOffer();
@@ -180,13 +212,10 @@ class VideoPlayer {
       var response = await fetch(signalingUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          notificationId: notificationId,
-          offer: {
-            type: pc.localDescription.type,
-            sdp: pc.localDescription.sdp
-          }
-        })
+        body: JSON.stringify(this._signalBody({
+          type: pc.localDescription.type,
+          sdp: pc.localDescription.sdp
+        }))
       });
 
       if (!response.ok) {
@@ -213,26 +242,31 @@ class VideoPlayer {
 
   // ---- HTTP Fallback ----
 
-  _loadHttpVideo(notificationId) {
+  _loadHttpVideo() {
     var video = this._videoEl;
     var poster = this._posterEl;
     var self = this;
 
     try {
-      var videoUrl = this._buildUrl('/brief/video', { id: notificationId });
+      var videoUrl = this._buildUrl('/brief/video', this._clipParams());
       console.log(this._logPrefix, 'Loading HTTP video:', videoUrl);
       this._statusFn('Loading video...');
 
       video.srcObject = null;
       video.src = videoUrl;
-      video.controls = true;
+      video.controls = false;
       video.onerror = function() { self.stopStallDetector(); self._statusFn('Failed to load video.'); };
       video.onloadeddata = function() { self._statusFn(''); };
       video.onplaying = function() {
-        video.classList.remove('loading');
-        poster.style.display = 'none';
-        self._statusFn('');
-        self.startStallDetector();
+        // Defer transition by two paint frames; see WebRTC path for rationale.
+        requestAnimationFrame(function() {
+          requestAnimationFrame(function() {
+            video.classList.remove('loading');
+            poster.style.display = 'none';
+            self._statusFn('');
+            self.startStallDetector();
+          });
+        });
       };
       video.play().catch(function() {});
     } catch (e) {
@@ -243,9 +277,12 @@ class VideoPlayer {
 
   // ---- Public API ----
 
-  async openVideo(notificationId) {
+  async openVideo(ref) {
     this.stopStallDetector();
-    this._currentNotificationId = notificationId;
+    // ref: a notificationId string (back-compat for Events/Brief) OR a
+    // descriptor { cameraId, time, posterUrl } for a Story (no notificationId).
+    this._currentRef = (typeof ref === 'string') ? { id: ref } : (ref || {});
+    this._currentNotificationId = this._currentRef.id || null;
 
     var video = this._videoEl;
     var poster = this._posterEl;
@@ -255,13 +292,14 @@ class VideoPlayer {
     // Reset video state
     video.srcObject = null;
     video.src = '';
-    video.controls = true;
+    video.controls = false;
     video.muted = true;
     video.classList.add('loading');
     this._replayOverlay.style.display = 'none';
 
-    // Show snapshot poster via URL (browser HTTP cache handles caching)
-    var snapshotUrl = this._buildUrl('/brief/snapshot', { id: notificationId });
+    // Poster: an explicit posterUrl (Story hero) wins; else the notification
+    // snapshot. Browser HTTP cache handles caching either way.
+    var snapshotUrl = this._currentRef.posterUrl || this._buildUrl('/brief/snapshot', this._clipParams());
     poster.src = snapshotUrl;
     poster.style.display = 'block';
 
@@ -273,17 +311,17 @@ class VideoPlayer {
     }
 
     // Try WebRTC first, fall back to HTTP
-    var webrtcSuccess = await this._tryWebRTC(notificationId);
+    var webrtcSuccess = await this._tryWebRTC();
     if (!webrtcSuccess) {
       console.log(this._logPrefix, 'WebRTC failed, falling back to HTTP');
-      this._loadHttpVideo(notificationId);
+      this._loadHttpVideo();
     }
   }
 
   async replay() {
     this.stopStallDetector();
     this._replayOverlay.style.display = 'none';
-    this._videoEl.controls = true;
+    this._videoEl.controls = false;
 
     if (this._currentPC) {
       var pc = this._currentPC;
@@ -291,13 +329,13 @@ class VideoPlayer {
       try { pc.close(); } catch (e) { console.warn(this._logPrefix, 'Error closing peer connection:', e); }
     }
 
-    if (this._currentNotificationId) {
+    if (this._hasRef()) {
       this._videoEl.classList.add('loading');
       this._statusFn('Connecting...');
-      var ok = await this._tryWebRTC(this._currentNotificationId);
+      var ok = await this._tryWebRTC();
       if (!ok) {
         console.log(this._logPrefix, 'WebRTC replay failed, falling back to HTTP');
-        this._loadHttpVideo(this._currentNotificationId);
+        this._loadHttpVideo();
       }
     } else {
       this._statusFn('Video URL not available for replay');
@@ -312,7 +350,7 @@ class VideoPlayer {
     video.pause();
     video.srcObject = null;
     video.src = '';
-    video.controls = true;
+    video.controls = false;
     video.classList.remove('loading');
     poster.style.display = 'none';
     poster.src = '';

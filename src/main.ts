@@ -21,7 +21,7 @@ const { StorageSettings } = require('@scrypted/sdk/storage-settings');
 const { mediaManager, endpointManager } = sdk;
 import { LRUCache } from 'lru-cache';
 import { WebRTCSignalingSession } from './webrtc';
-import { withTimeout, resizeJpegNearest, getJpegDimensions, stripJsonFences } from './utils';
+import { withTimeout, resizeJpegNearest, getJpegDimensions, extractFirstJsonObject, supportsRecordingStream } from './utils';
 
 import {
     StoredNotification,
@@ -33,16 +33,38 @@ import {
     CandidateWithPriority
 } from './types';
 import { NotificationStore } from './notification-store';
+import { PosterDecisionLog, PosterDecision } from './poster-decision-log';
 import { buildCachedHighlights } from './daily-brief/highlights';
 import { createTimeBuckets, isVehicleNotification, selectCandidatesFromBuckets } from './daily-brief/candidate-selection';
-import { getNaturalPeriods, buildFrozenContext, createSummaryPrompt } from './daily-brief/prompts';
+import { getNaturalPeriods, buildFrozenContext, createSummaryPrompt, toDisplayTimeRange, consolidatePeriodNarrative } from './daily-brief/prompts';
 import { generateDailyBriefHTML, getHACardBundle } from './daily-brief/html-generator';
 import { LLMNotifier } from './llm-notifier';
 import { PosterStore } from './poster-store';
 import { PersonStore } from './person-store';
-import { NotificationBuffer, BufferedNotification, DeliveryTarget } from './notification-buffer';
-import { groupNotifications, NotificationGroup } from './notification-grouper';
+import { buildPerEventClickData, sanitizeHaClickUrl } from './llm-notifier';
 import { handleGalleryDataRequest, handleGallerySearchRequest, handlePeopleRequest, handlePeoplePhotoRequest, handlePeopleDeleteRequest } from './gallery';
+import {
+    LlmTelemetryLog,
+    LlmJudgeLog,
+    TelemetryRow,
+    JudgeRow,
+    aggregateTelemetry,
+    pruneRows,
+    makeTelemetryId,
+    truncateError,
+} from './llm-telemetry';
+import { shouldSampleForJudging, runJudge, resolveJudgeProvider, JudgeInput } from './llm-judge';
+import * as path from 'path';
+import * as fsp from 'fs/promises';
+
+// Module-level singleton timer for the Daily Brief scheduled fire. Scrypted
+// has been observed instantiating LLMNotifierProvider more than once per
+// plugin load (e.g. duplicated "Daily Brief available at ..." in the startup
+// log), which previously caused each instance to arm its own 8:00 PM timer
+// and fire N notifications at the scheduled hour. Holding the timer at
+// module scope guarantees one timer in the process regardless of how many
+// provider instances exist — the last scheduleDailySummary caller wins.
+let dailyBriefTimer: NodeJS.Timeout | undefined;
 
 export function resolveNotificationProvider<T>(
     notificationLlm: T | undefined,
@@ -52,10 +74,52 @@ export function resolveNotificationProvider<T>(
     return selectProvider();
 }
 
+// Build the Brief tab lede: the LLM-generated 1-2 sentence overview from the
+// most recent period only. Joining all periods produced a wall of text that
+// duplicated the timeline below; the lede should be a fresh "what just
+// happened" intro, not a tour of every prior period.
+export function joinPeriodOverviews(frozenSegments: FrozenSegment[]): string {
+    const sorted = [...frozenSegments].sort((a, b) => a.periodStart - b.periodStart);
+    for (let i = sorted.length - 1; i >= 0; i--) {
+        const overview = sorted[i].overview;
+        if (overview && overview.length > 0) return overview;
+    }
+    return '';
+}
+
+/**
+ * A frozen narrative, healed for rendering. Every path that hands a frozen
+ * segment to setCachedSummary goes through here — the persisted timeRange may
+ * predate a label rename ("Thursday night" -> "Thursday early morning"), and
+ * an early-return path that skips healing serves the stale label on exactly
+ * the day the user checks whether the rename worked. Also clones: two of the
+ * three call sites used to pass the live persisted object by reference.
+ */
+export function renderFrozenNarrative(fs: FrozenSegment): NarrativeSegment {
+    return {
+        timeRange: toDisplayTimeRange(fs.narrative.timeRange),
+        text: fs.narrative.text,
+        highlightIds: [...fs.narrative.highlightIds],
+    };
+}
+
+/**
+ * Parse a brief date param (`?date=YYYY-MM-DD` or `/brief/YYYY-MM-DD`) into a Date.
+ *
+ * Anchored at NOON UTC so the calendar day survives conversion to any display
+ * timezone within UTC±12 (e.g. America/Los_Angeles). The prior code used
+ * `new Date(param + 'T00:00:00')`, which JS parses in the SERVER's local zone —
+ * UTC on the Linux host — putting the instant at 00:00 UTC. Downstream
+ * `toLocaleDateString(displayTz)` then shifted that back a day (picking 6/11
+ * rendered 6/10). Callers must pre-validate the YYYY-MM-DD shape.
+ */
+export function parseBriefDate(dateParam: string): Date {
+    return new Date(dateParam + 'T12:00:00Z');
+}
+
 export default class LLMNotifierProvider extends ScryptedDeviceBase implements MixinProvider, Settings, HttpRequestHandler {
     private currentProviderIndex = 0;
     private currentNotificationProviderIndex = 0;
-    private summaryScheduleTimeout: NodeJS.Timeout | undefined;
     private dailyBriefStartupTimer: NodeJS.Timeout | undefined;
     private dailyBriefIntervalTimer: NodeJS.Timeout | undefined;
     private pruneIntervalTimer: NodeJS.Timeout | undefined;
@@ -73,9 +137,16 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
     posterStore: PosterStore;
     personStore: PersonStore;
     notificationStore: NotificationStore;
-    notificationBuffer?: NotificationBuffer;
+    telemetryLog!: LlmTelemetryLog;
+    judgeLog!: LlmJudgeLog;
+    /** Latch so the "judging is inert" warning is said once, not per event. */
+    private judgeInertWarned = false;
+    posterDecisionLog!: PosterDecisionLog;
+    telemetrySink!: { record(row: TelemetryRow): void };
+    private telemetryPruneTimer: NodeJS.Timeout | undefined;
     private pluginVersion: string;
     private cachedLocalEndpoint: string | null = null;
+    private cachedCloudEndpoint: string | null = null;
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -84,6 +155,19 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         this.notificationStore.initDiskStorage().catch(e =>
             this.console.warn('[Daily Brief] Disk storage init failed:', e));
         this.personStore = new PersonStore(() => mediaManager.getFilesPath());
+
+        // Initialize LLM telemetry + judge logs (lazy — resolve filesPath on first use).
+        this.telemetryLog = new LlmTelemetryLog(async () => path.join(await mediaManager.getFilesPath(), 'llm-telemetry.jsonl'));
+        this.judgeLog = new LlmJudgeLog(async () => path.join(await mediaManager.getFilesPath(), 'llm-judge.jsonl'));
+        this.posterDecisionLog = new PosterDecisionLog(async () => path.join(await mediaManager.getFilesPath(), 'poster-decisions.jsonl'));
+        this.telemetrySink = {
+            record: (row: TelemetryRow) => {
+                // Fire-and-forget; never block or throw into caller.
+                this.telemetryLog.append(row).catch(err => {
+                    try { this.console.warn('[Telemetry] append failed:', err); } catch { /* ignore */ }
+                });
+            },
+        };
         try {
             this.pluginVersion = require('../package.json').version;
         } catch {
@@ -92,7 +176,25 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
         // Wire configurable retention (storageSettings not available in constructor)
         const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
-        this.notificationStore.setRetentionDays(isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw);
+        const retentionDays = isNaN(retentionDaysRaw) ? 3 : retentionDaysRaw;
+        this.notificationStore.setRetentionDays(retentionDays);
+        // prune()'s per-day cap buckets by calendar day; give it the user's
+        // zone so a local day isn't split across two UTC buckets.
+        this.notificationStore.setTimezone(this.storage.getItem('dailyBriefTimezone') || undefined);
+        // The store's constructor already pruned once, before it knew either
+        // setting, so redo it now that both are in hand.
+        this.notificationStore.pruneNow();
+
+        // Deterministic inert-judge check at load. The maybeRunJudge warning
+        // only fires once a sampled event with an inline image arrives, which
+        // at a low sample rate can be a long, silent wait. Raw storage is used
+        // because storageSettings is not available in the constructor.
+        const judgeRate = parseFloat(this.storage.getItem('llmJudgeSampleRate') || '0');
+        const judgeProviderId = this.storage.getItem('llmJudgeProvider');
+        if (judgeRate > 0 && !judgeProviderId) {
+            this.judgeInertWarned = true;
+            this.console.warn('[Judge] Judge Sample Rate is above 0 but no Judge LLM Provider is selected — nothing is being graded. Pick one in settings; a judge is never chosen for you.');
+        }
 
         // Cache endpoint URLs and log on startup (fire-and-forget)
         this.refreshEndpointCache();
@@ -106,16 +208,52 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         // Start periodic poster prune timer
         this.startPruneTimer();
 
-        // Initialize notification buffer for grouping (if enabled)
-        const groupingWindow = parseInt(this.storage.getItem('groupingWindow') || '0', 10);
-        if (!isNaN(groupingWindow) && groupingWindow > 0) {
-            this.notificationBuffer = new NotificationBuffer(
-                groupingWindow * 1000,
-                async (notifications, targets) => {
-                    await this.handleBufferFlush(notifications, targets);
-                },
-            );
-            this.console.log(`[Grouping] Buffer enabled with ${groupingWindow}s window`);
+        // One-shot migration: prune v0.3.83-v0.3.116 grouping artifacts.
+        // Fire-and-forget so it doesn't block constructor.
+        this.runStoriesGroupingMigration().catch(e =>
+            this.console.warn('[Stories] Migration prune failed:', e));
+    }
+
+    /**
+     * One-shot migration for installs that ran v0.3.83-v0.3.116 grouping.
+     * Removes any lingering composite poster files (posters/group-*.jpg)
+     * and strips orphan group fields (groupId, isGroupPrimary,
+     * llmGroupTitle/Subtitle/Body) from existing notification records.
+     * Idempotent — safe to run on every startup; subsequent runs are no-ops.
+     */
+    private async runStoriesGroupingMigration(): Promise<void> {
+        // 1. Prune composite poster files
+        const filesPath = await mediaManager.getFilesPath();
+        const postersDir = path.join(filesPath, 'posters');
+        let prunedPosters = 0;
+        try {
+            const entries = await fsp.readdir(postersDir);
+            for (const e of entries) {
+                if (e.startsWith('group-')) {
+                    try {
+                        await fsp.unlink(path.join(postersDir, e));
+                        prunedPosters++;
+                    } catch { /* ignore — best-effort */ }
+                }
+            }
+        } catch { /* posters dir may not exist on fresh installs */ }
+        if (prunedPosters > 0) {
+            this.console.log(`[Stories migration] Pruned ${prunedPosters} legacy composite poster files`);
+        }
+
+        // 2. Strip orphan group fields from notifications.jsonl
+        // Wait for notificationStore disk init first so getAll() returns disk records
+        try {
+            // initDiskStorage is fire-and-forget in the constructor; give it
+            // a chance to finish. The store internally guards against
+            // double-init, so calling it again is safe.
+            await this.notificationStore.initDiskStorage();
+        } catch (e) {
+            this.console.warn('[Stories migration] notificationStore init wait failed:', e);
+        }
+        const modified = this.notificationStore.stripLegacyGroupFields();
+        if (modified > 0) {
+            this.console.log(`[Stories migration] Stripped legacy group fields from ${modified} notification records`);
         }
     }
 
@@ -123,8 +261,31 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         try {
             this.cachedLocalEndpoint = await endpointManager.getLocalEndpoint(this.nativeId);
             this.console.log(`Daily Brief available at: ${this.cachedLocalEndpoint.replace(/\/+$/, '')}/brief`);
+            // Publish a Scrypted launcher entry so the Daily Brief is reachable
+            // from the launcher page instead of only by copying a URL out of
+            // settings. A relative path, not the SDK's absolute URL: that URL
+            // carries an IP:port, but users reach Scrypted by hostname or
+            // reverse proxy, and the launcher renders in whatever host the
+            // browser is already on.
+            this.applicationInfo = {
+                name: 'LLM Notifier',
+                description: 'Daily Brief, activity, and people',
+                icon: 'fa-bell',
+                href: `${new URL(this.cachedLocalEndpoint).pathname.replace(/\/+$/, '')}/brief`,
+            };
         } catch {
             // Endpoint may not be ready yet
+        }
+        try {
+            // Cloud endpoint resolves to whatever Scrypted Cloud has registered
+            // for this user's plugin (per-user domain + token). Used for the
+            // "Open Daily Brief (cloud)" settings link so the link works when
+            // the plugin is opened from a Scrypted Cloud admin host. Domain is
+            // never hardcoded — it comes entirely from the SDK.
+            this.cachedCloudEndpoint = await endpointManager.getCloudEndpoint(this.nativeId);
+        } catch {
+            // Cloud not configured / not signed into Scrypted Cloud — link is
+            // simply omitted in that case.
         }
     }
 
@@ -150,10 +311,10 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
     // Schedule daily summary generation and notification
     private scheduleDailySummary() {
-        // Clear any existing timeout
-        if (this.summaryScheduleTimeout) {
-            clearTimeout(this.summaryScheduleTimeout);
-            this.summaryScheduleTimeout = undefined;
+        // Clear any existing timeout (module-level — see dailyBriefTimer declaration).
+        if (dailyBriefTimer) {
+            clearTimeout(dailyBriefTimer);
+            dailyBriefTimer = undefined;
         }
 
         // Check if feature is enabled
@@ -170,9 +331,26 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone }); // YYYY-MM-DD
         const lastSentDate = this.storage.getItem('lastDailyBriefDate');
         if (lastSentDate !== todayStr && hoursUntil > 23) {
-            // hoursUntil > 23 means we're past the scheduled hour (timer wrapped to tomorrow)
+            // hoursUntil > 23 means we're past the scheduled hour (timer wrapped to tomorrow).
+            // Reserve today's slot NOW, synchronously, so rapid restarts during the
+            // generation window (3-9s LLM call) don't also schedule a fire. See Issue #7.
+            this.storage.setItem('lastDailyBriefDate', todayStr);
             this.console.log(`[Daily Brief] Missed today's ${hour}:00 notification (last sent: ${lastSentDate || 'never'}), firing now`);
-            this.summaryScheduleTimeout = setTimeout(async () => {
+            dailyBriefTimer = setTimeout(async () => {
+                // Cross-process race guard: the schedule-time setItem above
+                // claims today's slot, but two provider processes may have
+                // both read "yesterday" before either wrote. Re-read at fire
+                // time and skip if generateAndNotifySummary has already
+                // logged a successful fire (lastDailyBriefSentMs is set
+                // inside generateAndNotifySummary on success).
+                const sentMsRaw = this.storage.getItem('lastDailyBriefSentMs') || '0';
+                const sentMs = parseInt(sentMsRaw, 10) || 0;
+                const now = Date.now();
+                if (now - sentMs < 60 * 60 * 1000) {
+                    this.console.log(`[Daily Brief] Skipping missed-path fire — another process sent ${Math.round((now - sentMs) / 1000)}s ago`);
+                    this.scheduleDailySummary();
+                    return;
+                }
                 await this.generateAndNotifySummary();
                 this.scheduleDailySummary(); // Reschedule for tomorrow
             }, 5000); // Short delay to let plugin finish initializing
@@ -181,7 +359,25 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
         this.console.log(`Daily Brief scheduled in ${hoursUntil}h (${timezone}, ${hour}:00)`);
 
-        this.summaryScheduleTimeout = setTimeout(async () => {
+        dailyBriefTimer = setTimeout(async () => {
+            // Cross-process dedup: the user reported 4× notifications at the
+            // scheduled hour (2026-05-04). Module-scope dailyBriefTimer
+            // dedupes within one process, but two concurrent provider
+            // processes can each schedule a timer for the same hour.
+            // Re-check at fire time using lastDailyBriefSentMs (set inside
+            // generateAndNotifySummary on success). 1h dedup window — well
+            // larger than the LLM-generation latency (~3-9s) and any
+            // restart-storm window.
+            const sentMsRaw = this.storage.getItem('lastDailyBriefSentMs') || '0';
+            const sentMs = parseInt(sentMsRaw, 10) || 0;
+            const now = Date.now();
+            if (now - sentMs < 60 * 60 * 1000) {
+                this.console.log(`[Daily Brief] Skipping scheduled fire — another process sent ${Math.round((now - sentMs) / 1000)}s ago`);
+                this.scheduleDailySummary();
+                return;
+            }
+            const todayStrNow = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+            this.storage.setItem('lastDailyBriefDate', todayStrNow);
             await this.generateAndNotifySummary();
             this.scheduleDailySummary(); // Reschedule for next day
         }, ms);
@@ -259,9 +455,38 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             this.posterStore.pruneOlderThan(pruneAgeDays).then(n => {
                 if (n > 0) this.console.log(`[Poster] Periodic prune: removed ${n} posters older than ${pruneAgeDays} days`);
             }).catch(e => this.console.warn('[Poster] Periodic prune failed:', e));
+            this.pruneTelemetryLogs().catch(e => this.console.warn('[Telemetry] Periodic prune failed:', e));
         }, 24 * 60 * 60 * 1000);
 
         this.console.log(`[Poster] Prune timer set: daily, deleting posters older than ${pruneAgeDays} days`);
+    }
+
+    private async pruneTelemetryLogs() {
+        const daysRaw = parseInt(this.storage.getItem('llmTelemetryRetentionDays') || '14', 10);
+        const days = isNaN(daysRaw) ? 14 : Math.max(1, Math.min(90, daysRaw));
+        const now = Date.now();
+
+        try {
+            const rows = await this.telemetryLog.loadAll();
+            const kept = pruneRows(rows, days, now);
+            if (kept.length < rows.length) {
+                await this.telemetryLog.compact(kept);
+                this.console.log(`[Telemetry] Pruned ${rows.length - kept.length} telemetry rows older than ${days}d`);
+            }
+        } catch (e) {
+            this.console.warn('[Telemetry] Prune telemetry log failed:', e);
+        }
+
+        try {
+            const jrows = await this.judgeLog.loadAll();
+            const kept = pruneRows(jrows, days, now);
+            if (kept.length < jrows.length) {
+                await this.judgeLog.compact(kept);
+                this.console.log(`[Telemetry] Pruned ${jrows.length - kept.length} judge rows older than ${days}d`);
+            }
+        } catch (e) {
+            this.console.warn('[Telemetry] Prune judge log failed:', e);
+        }
     }
 
     // Generate narrative for a single 6-hour period
@@ -273,7 +498,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         isCompleted: boolean,
         customInstructions?: string,
         frozenContext?: string,
-    ): Promise<{ narrative: NarrativeSegment[]; highlights: CachedHighlight[]; frozen?: FrozenSegment } | null> {
+    ): Promise<{ narrative: NarrativeSegment[]; overview: string; highlights: CachedHighlight[]; frozen?: FrozenSegment } | null> {
         // Filter notifications to this period
         const periodNotifications = notifications.filter(
             n => n.timestamp >= period.start && n.timestamp < period.end
@@ -284,12 +509,14 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             if (isCompleted) {
                 return {
                     narrative: [],
+                    overview: '',
                     highlights: [],
                     frozen: {
                         periodKey: period.key,
                         periodStart: period.start,
                         periodEnd: period.end,
                         narrative: { timeRange: period.label, text: '', highlightIds: [] },
+                        overview: '',
                         highlights: [],
                         highlightNotificationIds: [],
                     },
@@ -306,12 +533,14 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             if (isCompleted) {
                 return {
                     narrative: [],
+                    overview: '',
                     highlights: [],
                     frozen: {
                         periodKey: period.key,
                         periodStart: period.start,
                         periodEnd: period.end,
                         narrative: { timeRange: period.label, text: '', highlightIds: [] },
+                        overview: '',
                         highlights: [],
                         highlightNotificationIds: [],
                     },
@@ -340,34 +569,37 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 .map(idx => candidates[idx].notification.id) as any[],
         }));
 
-        // Consolidate multi-segment responses into a single narrative segment per period
-        let consolidatedNarrative: NarrativeSegment;
-        if (periodNarrative.length > 1) {
+        // Consolidate multi-segment responses into a single narrative segment
+        // per period. Total over empty input (issue #12): a parse-failure
+        // fallback or a fully-filtered response degrades this period to empty
+        // instead of throwing and aborting every remaining period in the run.
+        if (periodNarrative.length === 0)
+            this.console.warn(`[Daily Brief] Period ${period.label}: LLM returned an empty narrative — rendering the period empty and continuing`);
+        else if (periodNarrative.length > 1)
             this.console.log(`[Daily Brief] Period ${period.label}: LLM returned ${periodNarrative.length} segments, consolidating`);
-            consolidatedNarrative = {
-                timeRange: period.label,
-                text: periodNarrative.map(s => s.text).join(' '),
-                highlightIds: [...new Set(periodNarrative.flatMap(s => s.highlightIds))],
-            };
-        } else {
-            consolidatedNarrative = periodNarrative[0];
-        }
+        const consolidatedNarrative = consolidatePeriodNarrative(periodNarrative, period.label);
 
-        // Freeze if period is completed
+        // Freeze if completed AND the LLM actually produced something. An
+        // empty narrative here is an LLM failure, not a quiet period —
+        // candidates existed (the no-candidates case returned earlier).
+        // Frozen keys are never regenerated, so freezing it would blank the
+        // period PERMANENTLY; leaving it unfrozen means the next hourly run
+        // retries — one LLM call per cycle, bounded by the 24h window.
         let frozen: FrozenSegment | undefined;
-        if (isCompleted) {
+        if (isCompleted && periodNarrative.length > 0) {
             frozen = {
                 periodKey: period.key,
                 periodStart: period.start,
                 periodEnd: period.end,
                 narrative: consolidatedNarrative,
+                overview: overview || '',
                 highlights,
                 // Derive from the consolidated narrative to stay in sync
                 highlightNotificationIds: consolidatedNarrative.highlightIds as unknown as string[],
             };
         }
 
-        return { narrative: [consolidatedNarrative], highlights, frozen };
+        return { narrative: [consolidatedNarrative], overview: overview || '', highlights, frozen };
     }
 
     // Generate Daily Brief summary in background (no notification)
@@ -396,7 +628,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
             const msSinceMidnight = ((tzHour * 60 + tzMinute) * 60 + tzSecond) * 1000;
             const midnightTodayUtc = windowEnd - msSinceMidnight;
-            const windowStart = midnightTodayUtc - (24 * 60 * 60 * 1000); // Midnight yesterday
+            const windowStart = midnightTodayUtc; // Midnight today (24h window — was 48h pre-v0.3.110, confused readers when yesterday's events led the lede)
 
             this.console.log(`[Daily Brief] Window: ${new Date(windowStart).toISOString()} to ${new Date(windowEnd).toISOString()} (${timezone})`);
 
@@ -447,9 +679,9 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             if (periodsToGenerate.length === 0 && existingFrozen.length > 0) {
                 this.console.log(`[Daily Brief] All periods frozen, updating cache timestamp (${existingFrozen.length} frozen segments)`);
                 const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
-                const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(fs => fs.narrative);
+                const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(renderFrozenNarrative);
                 frozenHighlights.forEach((h, i) => { h.index = i; });
-                const overview = frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
+                const overview = joinPeriodOverviews(existingFrozen);
                 this.notificationStore.setCachedSummary(
                     now, overview, notifications.length, frozenHighlights,
                     windowStart, windowEnd, timezone, overview, frozenNarrative, existingFrozen
@@ -468,10 +700,10 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 this.console.log(`[Daily Brief] No new notifications in active periods, keeping frozen segments`);
                 // Re-store with existing data (updates generatedAt)
                 const frozenHighlights = existingFrozen.flatMap(fs => fs.highlights);
-                const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(fs => fs.narrative);
+                const frozenNarrative = existingFrozen.filter(fs => fs.narrative.text).map(renderFrozenNarrative);
                 // Re-index highlights contiguously
                 frozenHighlights.forEach((h, i) => { h.index = i; });
-                const overview = frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
+                const overview = joinPeriodOverviews(existingFrozen);
                 this.notificationStore.setCachedSummary(
                     now, overview, notifications.length, frozenHighlights,
                     windowStart, windowEnd, timezone, overview, frozenNarrative, existingFrozen
@@ -492,6 +724,10 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             const allNewNarrative: NarrativeSegment[] = [];
             const allNewHighlights: CachedHighlight[] = [];
             const newFrozen: FrozenSegment[] = [...existingFrozen];
+            // Per-period overviews from active (non-completed) periods this run. Active
+            // periods don't produce a FrozenSegment but their LLM overview must still
+            // contribute to the day-level lede (issue #10).
+            const activePeriodOverviewSegments: FrozenSegment[] = [];
             let accumulatedFrozenContext = frozenContext;
 
             for (const period of periodsToGenerate) {
@@ -507,6 +743,22 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     if (result.frozen) {
                         newFrozen.push(result.frozen);
                         frozenKeys.add(result.frozen.periodKey);
+                    } else if (result.overview) {
+                        // No frozen segment but a usable overview: an active
+                        // (still-running) period, or a completed one whose
+                        // narrative failed and stays retryable. Synthesize an
+                        // overview-only FrozenSegment for joinPeriodOverviews
+                        // ordering. Not stored in cache — deliberately, so the
+                        // failed-narrative case is regenerated next run.
+                        activePeriodOverviewSegments.push({
+                            periodKey: period.key,
+                            periodStart: period.start,
+                            periodEnd: period.end,
+                            narrative: { timeRange: period.label, text: '', highlightIds: [] },
+                            overview: result.overview,
+                            highlights: [],
+                            highlightNotificationIds: [],
+                        });
                     }
                     // Accumulate context for subsequent periods (same format as buildFrozenContext)
                     if (result.narrative.length > 0) {
@@ -527,11 +779,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             const narrativeToFrozen = new Map<NarrativeSegment, FrozenSegment>();
             for (const fs of existingFrozen) {
                 if (!fs.narrative.text) continue;
-                const cloned: NarrativeSegment = {
-                    timeRange: fs.narrative.timeRange,
-                    text: fs.narrative.text,
-                    highlightIds: [...fs.narrative.highlightIds],
-                };
+                const cloned = renderFrozenNarrative(fs);
                 frozenNarrative.push(cloned);
                 narrativeToFrozen.set(cloned, fs);
             }
@@ -566,9 +814,11 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 return aTime - bTime;
             });
 
-            // 8. Build final summary
-            const mergedOverview = allNewNarrative.map(s => s.text).join(' ').slice(0, 200)
-                || frozenNarrative.map(s => s.text).join(' ').slice(0, 200);
+            // 8. Build final summary from per-period LLM overviews (issue #10).
+            // newFrozen contains every completed period's frozen segment with its
+            // overview field; active (still-running) periods that aren't frozen
+            // contribute their overview via activePeriodOverviews collected in the loop.
+            const mergedOverview = joinPeriodOverviews([...newFrozen, ...activePeriodOverviewSegments]);
 
             this.notificationStore.setCachedSummary(
                 now, mergedOverview, notifications.length, mergedHighlights,
@@ -600,8 +850,10 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             // Send notification
             this.console.log('[Daily Brief] Summary generated, sending notification...');
             await this.sendDailyBriefNotification(today, cached.summary, cached.notificationCount);
-            // Record sent date so we don't re-send on restart
-            this.storage.setItem('lastDailyBriefDate', today.toLocaleDateString('en-CA', { timeZone: timezone }));
+            // Cross-process dedup marker. Other timers re-read this and skip
+            // their fire if it's within the last hour. See scheduleDailySummary.
+            this.storage.setItem('lastDailyBriefSentMs', String(Date.now()));
+            // Note: scheduler reserves lastDailyBriefDate synchronously before firing (Issue #7)
             this.console.log('[Daily Brief] Summary generated and notification sent');
         } catch (e) {
             this.console.error('Failed to generate scheduled summary:', e);
@@ -659,17 +911,40 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
         this.console.log(`[Daily Brief] Sending ${limitedCandidates.length} candidates to LLM (prompt: ${promptSize} chars, timeout: ${timeoutMs}ms)`);
 
+        const telemetryId = makeTelemetryId();
+        const providerName = (device as any).name || '(unnamed)';
         const llmStartTime = Date.now();
+        const emitTelemetry = (row: Omit<TelemetryRow, 'id' | 'ts' | 'providerName' | 'role' | 'timeoutMs' | 'promptBytes'>) => {
+            try {
+                this.telemetrySink.record({
+                    id: telemetryId,
+                    ts: Date.now(),
+                    providerName,
+                    role: 'daily-brief',
+                    timeoutMs,
+                    promptBytes: promptSize,
+                    ...row,
+                });
+            } catch { /* ignore */ }
+        };
+
         try {
-            const result = await withTimeout(
-                device.getChatCompletion({
-                    ...prompt,
-                    temperature: 0.1,
-                    max_tokens: 2000  // Increased for narrative response
-                } as any),
-                timeoutMs,
-                'Daily summary generation'
-            );
+            let result: any;
+            try {
+                result = await withTimeout(
+                    device.getChatCompletion({
+                        ...prompt,
+                        temperature: 0.1,
+                        max_tokens: 8000  // 2000 was truncating multi-period narratives mid-sentence
+                    } as any),
+                    timeoutMs,
+                    'Daily summary generation'
+                );
+            } catch (err) {
+                const outcome = /timed out|timeout/i.test((err as Error).message || '') ? 'timeout' : 'error';
+                emitTelemetry({ outcome, latencyMs: Date.now() - llmStartTime, errorMsg: truncateError(err) });
+                throw err;
+            }
 
             const llmElapsed = Date.now() - llmStartTime;
             this.console.log(`[Daily Brief] LLM completed in ${llmElapsed}ms`);
@@ -678,12 +953,17 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             this.console.log(`[Daily Brief] Response length: ${content?.length || 0} chars`);
 
             if (!content) {
-                throw new Error('Empty response from LLM');
+                const err = new Error('Empty response from LLM');
+                emitTelemetry({ outcome: 'parse_error', latencyMs: llmElapsed, errorMsg: err.message });
+                throw err;
             }
+
+            const responseBytes = Buffer.byteLength(content, 'utf8');
 
             // Parse JSON response (strip markdown code blocks if present)
             try {
-                const json = JSON.parse(stripJsonFences(content));
+                const json = JSON.parse(extractFirstJsonObject(content));
+                emitTelemetry({ outcome: 'ok', latencyMs: llmElapsed, responseBytes });
 
                 // Handle new narrative format with explicit validation (#7)
                 if (!json.overview || typeof json.overview !== 'string') {
@@ -775,6 +1055,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 return { summary: summary.trim(), overview, narrative: narrativeSegments, highlightIds };
             } catch (parseErr) {
                 // Fallback: treat entire response as summary with no highlights
+                emitTelemetry({ outcome: 'parse_error', latencyMs: llmElapsed, responseBytes, errorMsg: truncateError(parseErr) });
                 this.console.warn(`[Daily Brief] JSON parse failed, using plain text:`, parseErr);
                 return { summary: content.trim(), highlightIds: [] };
             }
@@ -897,6 +1178,75 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             return;
         }
 
+        // LLM Health dashboard JSON: per-provider reliability/latency/quality aggregates
+        if (path === '/brief/poster-decisions') {
+            // v0.3.120 diagnostic: returns the last N poster decisions so
+            // operator can see which path produced (or failed to produce)
+            // each event's poster, without needing Scrypted log access.
+            try {
+                const url = new URL(request.url || '/', 'http://localhost');
+                const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') ?? '100', 10) || 100));
+                const rows = await this.posterDecisionLog.loadRecent(limit);
+                // Aggregate source-breakdown for quick scanning at the top.
+                const breakdown: Record<string, number> = {};
+                for (const r of rows) breakdown[r.source] = (breakdown[r.source] || 0) + 1;
+                response.send(JSON.stringify({ generatedAt: Date.now(), count: rows.length, breakdown, rows }), {
+                    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+                });
+            } catch (e) {
+                this.console.warn('[PosterDecisions] endpoint failed:', e);
+                response.send(JSON.stringify({ error: String(e) }), {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            return;
+        }
+
+        if (path === '/brief/llm-health') {
+            try {
+                const [telemetry, judge] = await Promise.all([
+                    this.telemetryLog.loadAll(),
+                    this.judgeLog.loadAll(),
+                ]);
+                const now = Date.now();
+                const minute = 60 * 1000;
+                const hour = 60 * minute;
+                const day = 24 * hour;
+                const cutoff15m = now - 15 * minute;
+                const cutoff1h = now - hour;
+                const cutoff24h = now - day;
+                const cutoff7d = now - 7 * day;
+                const rows15m = telemetry.filter(r => r.ts >= cutoff15m);
+                const rows1h = telemetry.filter(r => r.ts >= cutoff1h);
+                const rows24 = telemetry.filter(r => r.ts >= cutoff24h);
+                const rows7d = telemetry.filter(r => r.ts >= cutoff7d);
+                const judge15m = judge.filter(j => j.ts >= cutoff15m);
+                const judge1h = judge.filter(j => j.ts >= cutoff1h);
+                const judge24 = judge.filter(j => j.ts >= cutoff24h);
+                const judge7d = judge.filter(j => j.ts >= cutoff7d);
+                const payload = {
+                    generatedAt: now,
+                    windows: {
+                        '15m': aggregateTelemetry(rows15m, now, judge15m),
+                        '1h': aggregateTelemetry(rows1h, now, judge1h),
+                        '24h': aggregateTelemetry(rows24, now, judge24),
+                        '7d': aggregateTelemetry(rows7d, now, judge7d),
+                    },
+                };
+                response.send(JSON.stringify(payload), {
+                    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+                });
+            } catch (e) {
+                this.console.warn('[LLM Health] Failed to build aggregates:', e);
+                response.send(JSON.stringify({ error: String(e) }), {
+                    code: 500,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            return;
+        }
+
         // Debug endpoint to check cloud URL (authenticated)
         if (path === '/brief/cloud-url') {
             const cloudEndpoint = await endpointManager.getCloudEndpoint(this.nativeId);
@@ -946,14 +1296,14 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         let targetDate = new Date();
         const dateMatch = path.match(/\/brief\/(\d{4}-\d{2}-\d{2})/);
         if (dateMatch) {
-            targetDate = new Date(dateMatch[1] + 'T00:00:00');
+            targetDate = parseBriefDate(dateMatch[1]);
         } else {
             // Check query parameter
             try {
                 const urlObj = new URL(url, 'http://localhost');
                 const dateParam = urlObj.searchParams.get('date');
                 if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
-                    targetDate = new Date(dateParam + 'T00:00:00');
+                    targetDate = parseBriefDate(dateParam);
                 }
             } catch (e) {
                 // Ignore parse errors
@@ -997,7 +1347,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 mode = 'full';
             }
             const baseUrl = request.rootPath || '';
-            const allNotifications = this.notificationStore.getForDate(targetDate);
+            const allNotifications = this.notificationStore.getForDate(targetDate, timezone);
 
             const data = await this.getDailyBriefData(targetDate, timezone, mode, allNotifications, baseUrl);
 
@@ -1014,12 +1364,16 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         if (path === '/brief/video') {
             const urlObj = new URL(url, 'http://localhost');
             const notificationId = urlObj.searchParams.get('id') || '';
+            const reqCameraId = urlObj.searchParams.get('cameraId') || '';
+            const reqTime = urlObj.searchParams.get('time') || '';
 
-            // If notification ID provided, fetch clip from NVR via VideoRecorder
+            // Resolve the clip's camera + anchor time. A notification resolves via
+            // the store (anchor = timestamp - 5s pre-roll). A Story has no
+            // notificationId, so the client passes cameraId + time (the Story
+            // start) directly. Notification path is unchanged.
+            let clipCameraId = '';
+            let clipStartTime = 0;
             if (notificationId) {
-                this.console.log(`[Video] START - Fetching clip for notification: ${notificationId}`);
-
-                // Look up the notification to get timestamp and camera
                 const notification = this.notificationStore.getById(notificationId);
                 if (!notification) {
                     this.console.warn(`[Video] Notification not found: ${notificationId}`);
@@ -1029,15 +1383,40 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     });
                     return;
                 }
+                clipCameraId = notification.cameraId;
+                // v0.3.173: seek by the instant the poster used, not our handling
+                // time. They differ by 44-300s on a Story, which is emitted when
+                // the story completes, so the clip used to run minutes late while
+                // the poster was correct.
+                clipStartTime = (notification.seekTimestamp ?? notification.timestamp) - 5000;
+            } else if (reqCameraId && reqTime) {
+                const t = Number(reqTime);
+                if (!Number.isFinite(t) || t <= 0) {
+                    response.send(JSON.stringify({ error: 'Invalid time parameter' }), {
+                        code: 400,
+                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                    });
+                    return;
+                }
+                clipCameraId = reqCameraId;
+                clipStartTime = t;
+            }
 
-                this.console.log(`[Video] Found notification: cameraId=${notification.cameraId}, timestamp=${notification.timestamp}`);
+            // If we resolved a camera + anchor, fetch the clip from NVR.
+            if (clipCameraId && clipStartTime) {
+                this.console.log(`[Video] START - clip for camera=${clipCameraId} @ ${new Date(clipStartTime).toISOString()}`);
 
-                // Find the camera with VideoRecorder interface
-                const camera = sdk.systemManager.getDeviceById<VideoRecorder & ScryptedDevice>(notification.cameraId);
+                // Resolve the camera. Gate on METHOD PRESENCE, not the
+                // VideoRecorder interface flag — UniFi Protect cameras expose a
+                // working getRecordingStream but may not advertise the interface
+                // (same bug as the v0.3.166 poster fix). The getRecordingStream
+                // call below is wrapped in try/catch, so a camera that truly
+                // can't serve fails cleanly.
+                const camera = sdk.systemManager.getDeviceById<VideoRecorder & ScryptedDevice>(clipCameraId);
                 this.console.log(`[Video] Camera found: ${!!camera}, interfaces: ${camera?.interfaces?.join(',')}`);
 
-                if (!camera?.interfaces?.includes('VideoRecorder')) {
-                    this.console.warn(`[Video] Camera ${notification.cameraId} doesn't support VideoRecorder`);
+                if (!supportsRecordingStream(camera)) {
+                    this.console.warn(`[Video] Camera ${clipCameraId} does not expose getRecordingStream`);
                     response.send(JSON.stringify({ error: 'Camera does not support video recording' }), {
                         code: 400,
                         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -1055,8 +1434,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 };
 
                 try {
-                    // Request a 25-second clip: 5s before detection, 20s after
-                    const startTime = notification.timestamp - 5000;
+                    // Request a 25-second clip from the resolved anchor.
+                    const startTime = clipStartTime;
                     const duration = 25000;
 
                     this.console.log(`[Video] Calling getRecordingStream: startTime=${new Date(startTime).toISOString()}, duration=${duration}ms`);
@@ -1160,8 +1539,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 }
             }
 
-            // No notification ID provided
-            response.send(JSON.stringify({ error: 'Missing notification id parameter' }), {
+            // No usable clip reference (neither notification id nor cameraId+time)
+            response.send(JSON.stringify({ error: 'Missing id or cameraId+time parameter' }), {
                 code: 400,
                 headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
             });
@@ -1183,7 +1562,6 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 return;
             }
 
-            // Look up the notification to get timestamp and camera
             const notification = this.notificationStore.getById(notificationId);
             if (!notification) {
                 response.send(JSON.stringify({ error: 'Notification not found' }), {
@@ -1210,6 +1588,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 }
 
                 // 2. No image data at all
+                this.console.log(`[Poster] Disk MISS: ${notificationId}`);
                 response.send(JSON.stringify({ error: 'No snapshot available' }), {
                     code: 404,
                     headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -1245,29 +1624,61 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 const body = JSON.parse(request.body || '{}');
                 const { notificationId, offer } = body;
 
-                if (!notificationId || !offer?.sdp) {
-                    response.send(JSON.stringify({ error: 'Missing notificationId or offer.sdp' }), {
+                if (!offer?.sdp) {
+                    response.send(JSON.stringify({ error: 'Missing offer.sdp' }), {
                         code: 400,
                         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                     });
                     return;
                 }
 
-                this.console.log(`[WebRTC] Starting signaling for notification: ${notificationId}`);
-
-                // Look up the notification to get camera and timestamp
-                const notification = this.notificationStore.getById(notificationId);
-                if (!notification) {
-                    response.send(JSON.stringify({ error: 'Notification not found' }), {
-                        code: 404,
+                // Resolve camera + anchor time from either a notificationId (store
+                // lookup, anchor = timestamp - 5s) or an explicit cameraId+time
+                // (Stories, which have no notificationId). Mirrors /brief/video.
+                let clipCameraId = '';
+                let clipStartTime = 0;
+                if (notificationId) {
+                    const notification = this.notificationStore.getById(notificationId);
+                    if (!notification) {
+                        response.send(JSON.stringify({ error: 'Notification not found' }), {
+                            code: 404,
+                            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                        });
+                        return;
+                    }
+                    clipCameraId = notification.cameraId;
+                    // v0.3.173: seek by the instant the poster used, not our handling
+                    // time. They differ by 44-300s on a Story, which is emitted
+                    // when the story completes, so the clip used to run minutes
+                    // late while the poster was correct.
+                    clipStartTime = (notification.seekTimestamp ?? notification.timestamp) - 5000;
+                } else if (body.cameraId && body.time) {
+                    const t = Number(body.time);
+                    if (!Number.isFinite(t) || t <= 0) {
+                        response.send(JSON.stringify({ error: 'Invalid time' }), {
+                            code: 400,
+                            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+                        });
+                        return;
+                    }
+                    clipCameraId = body.cameraId;
+                    clipStartTime = t;
+                } else {
+                    response.send(JSON.stringify({ error: 'Missing notificationId or cameraId+time' }), {
+                        code: 400,
                         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
                     });
                     return;
                 }
 
-                // Get the camera with VideoRecorder interface
-                const camera = sdk.systemManager.getDeviceById<VideoRecorder & ScryptedDevice>(notification.cameraId);
-                if (!camera?.interfaces?.includes('VideoRecorder')) {
+                this.console.log(`[WebRTC] Starting signaling for camera=${clipCameraId} @ ${new Date(clipStartTime).toISOString()}`);
+
+                // Resolve the camera. Gate on METHOD PRESENCE, not the
+                // VideoRecorder interface flag (see the HTTP-replay handler
+                // above and the v0.3.166 poster fix). getRecordingStream is
+                // called inside this handler's outer try/catch.
+                const camera = sdk.systemManager.getDeviceById<VideoRecorder & ScryptedDevice>(clipCameraId);
+                if (!supportsRecordingStream(camera)) {
                     response.send(JSON.stringify({ error: 'Camera does not support video recording' }), {
                         code: 400,
                         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -1275,8 +1686,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                     return;
                 }
 
-                // Request a 25-second clip: 5s before detection, 20s after
-                const startTime = notification.timestamp - 5000;
+                // Request a 25-second clip from the resolved anchor.
+                const startTime = clipStartTime;
                 const duration = 25000;
 
                 this.console.log(`[WebRTC] Getting recording stream: startTime=${new Date(startTime).toISOString()}, duration=${duration}ms`);
@@ -1463,7 +1874,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         }
 
         if (path === '/brief' || path.startsWith('/brief/')) {
-            const allNotifications = this.notificationStore.getForDate(targetDate);
+            const allNotifications = this.notificationStore.getForDate(targetDate, timezone);
             const urlObj = new URL(request.url || '', 'http://localhost');
             // Parse mode: ?mode=incremental|full|normal (default: normal)
             // Legacy: ?refresh=true maps to mode=full
@@ -1482,7 +1893,7 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
             // Check for JSON API request (keep simple - doesn't need full DailyBriefData)
             if (path.endsWith('/api') || urlObj.searchParams.get('format') === 'json') {
-                const stats = this.notificationStore.getStats(targetDate);
+                const stats = this.notificationStore.getStats(targetDate, timezone);
                 const cached = this.notificationStore.getCachedSummary(targetDate, timezone);
                 response.send(JSON.stringify({ date: dateStr, stats, notifications: allNotifications, summary: cached?.summary, highlights: cached?.highlights }, null, 2), {
                     headers: { 'Content-Type': 'application/json' }
@@ -1493,6 +1904,17 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
             // Use shared helper for data fetching and transformation
             // Don't pass baseUrl — web UI derives it at runtime from window.location.pathname
             const data = await this.getDailyBriefData(targetDate, timezone, mode, allNotifications);
+
+            // Date-selector bounds (timezone-aware YYYY-MM-DD). selectedDate is the
+            // day being viewed; max = today; min = today - retentionDays, so every
+            // selectable day still has full timeline + image data (the /brief route
+            // already honors ?date=YYYY-MM-DD — this just drives the header control).
+            const retentionDaysRaw = parseInt(this.storage.getItem('retentionDays') || '3', 10);
+            const retentionDays = isNaN(retentionDaysRaw) ? 3 : Math.max(1, retentionDaysRaw);
+            const selectedDate = targetDate.toLocaleDateString('en-CA', { timeZone: timezone });
+            const maxDate = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+            const minDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+                .toLocaleDateString('en-CA', { timeZone: timezone });
 
             // HTML response
             this.console.log(`[Daily Brief] Generating HTML response (narrative: ${data.narrative?.length || 0} segments)`);
@@ -1505,6 +1927,11 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
                 data.overview,
                 data.narrative,
                 this.pluginVersion,
+                this.cachedCloudEndpoint || undefined,
+                (this.storageSettings.values as any).haNvrTimelinePath || undefined,
+                selectedDate,
+                minDate,
+                maxDate,
             );
             this.console.log(`[Daily Brief] Sending HTML (${html.length} bytes)`);
             response.send(html, {
@@ -1536,26 +1963,26 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
 
     storageSettings = new StorageSettings(this, {
         enabled: {
-            title: 'Enable LLM Enhancement',
+            title: 'Enable Notifications',
             type: 'boolean',
-            description: 'Enable LLM-based notification enhancement',
+            description: 'Enhance notifications with LLM-generated titles and descriptions. When off, the plugin passes the original notification through unchanged. To stop them entirely, disable the LLM Notifier extension on this notifier device in Scrypted\'s device list.',
             defaultValue: true,
-            group: 'Advanced',
+            group: 'Notifications',
         },
         snapshotMode: {
             title: 'Snapshot Mode',
-            description: 'Which image(s) to send to the LLM',
+            description: "Which image(s) to send to the LLM. 'full' (default) sends the full event frame — required for the LLM to pick the poster focus box so the notification thumbnail matches the description. 'cropped' sends only Scrypted's tight detection thumbnail (no poster focus box; poster falls back to the heuristic crop). 'both' sends the full frame AND the tight crop (best detail for distant subjects, at ~2x image cost per notification).",
             type: 'string',
             choices: ['cropped', 'full', 'both'],
-            defaultValue: 'cropped',
-            group: 'Advanced',
+            defaultValue: 'full',
+            group: 'Notifications',
         },
         llmTimeoutMs: {
             title: 'LLM Timeout (sec)',
             description: 'Maximum seconds to wait for the LLM before falling back to original notification.',
             type: 'number',
             defaultValue: 90,
-            group: 'Advanced',
+            group: 'Notifications',
         },
         chatCompletions: {
             title: 'LLM Providers',
@@ -1567,8 +1994,8 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         },
         notificationLlm: {
             title: 'Notification LLM',
-            description: 'Optional: Use dedicated models for per-detection enrichment (e.g., local LLMs). '
-                + 'Daily Brief, Person ID, and notification grouping always use the main LLM Providers. '
+            description: 'Optional: use dedicated models for enriching individual detections (e.g., a fast local LLM). '
+                + 'Daily Brief and Person ID always use the main LLM Providers. '
                 + 'If not set, all features use LLM Providers.',
             type: 'device',
             deviceFilter: `interfaces.includes('ChatCompletion')`,
@@ -1578,11 +2005,12 @@ export default class LLMNotifierProvider extends ScryptedDeviceBase implements M
         userPrompt: {
             title: 'Notification Style',
             type: 'textarea',
-            description: 'Customize how notifications describe detections. v12 improvements available in README.',
+            description: 'Optional: override the built-in wording instructions for how notifications describe detections.',
+            group: 'Notifications',
             defaultValue: `STYLE PREFERENCES:
 
 Title: Include person names ONLY when provided in metadata, otherwise use generic terms
-- When name known: "Richard at front door"
+- When name known: "<name> at front door"
 - When name unknown: "Person at front door"
 - For vehicles: Include make/model and license plate only if clearly visible
 
@@ -1602,28 +2030,20 @@ Body: Focus on actions and key visual details
 Common locations: driveway, street, kitchen, living room, front door, yard, garage
 
 Avoid generic phrases like "motion detected" or "person detected"`,
-            group: 'General',
         },
         includeOriginalMessage: {
             title: 'Include Original Message',
             type: 'boolean',
             description: 'Include the original notification text in the LLM prompt for context',
             defaultValue: true,
-            group: 'Advanced',
-        },
-        groupingWindow: {
-            title: 'Grouping Window (sec)',
-            type: 'number',
-            description: 'Buffer notifications for this many seconds, then group related events via LLM to reduce notification noise. Set to 0 to disable (instant delivery).',
-            defaultValue: 0,
-            group: 'Advanced',
+            group: 'Notifications',
         },
         enableLlmFaceId: {
             title: 'LLM Person Identification',
             type: 'boolean',
-            description: 'When enabled, auto-curates reference photos from Scrypted face identifications, then uses the LLM to identify unrecognized persons by comparing against known faces.',
+            description: 'Optional: auto-curates reference photos from Scrypted face identifications, then uses the LLM to identify unrecognized persons by comparing against known faces.',
             defaultValue: false,
-            group: 'Advanced',
+            group: 'Notifications',
         },
         verboseLogging: {
             title: 'Verbose Logging',
@@ -1632,22 +2052,43 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             defaultValue: false,
             group: 'Advanced',
         },
+        llmTelemetryRetentionDays: {
+            title: 'LLM Telemetry Retention (days)',
+            type: 'number',
+            description: 'How long to keep per-call LLM telemetry rows (latency/outcome/quality scores). Used by the LLM Health tab.',
+            defaultValue: 14,
+            group: 'LLM Health',
+        },
+        llmJudgeSampleRate: {
+            title: 'Judge Sample Rate',
+            type: 'number',
+            description: 'Optional: fraction (0–1) of notification LLM calls to re-evaluate with the Judge provider for accuracy/completeness scoring. 0 = off.',
+            defaultValue: 0,
+            group: 'LLM Health',
+        },
+        llmJudgeProvider: {
+            title: 'Judge LLM Provider',
+            type: 'device',
+            deviceFilter: `interfaces.includes('ChatCompletion')`,
+            description: 'Optional: LLM provider used to grade notification enrichment output. Only used when Judge Sample Rate is above 0. Leave unset and nothing is graded — a judge is never chosen for you, because a model grading its own output is a weak check that still costs a call. Pick the same provider as your notification LLM if that is genuinely what you want.',
+            group: 'LLM Health',
+        },
         dailyBriefUrl: {
             title: 'Daily Brief URL',
             type: 'html',
             description: 'Opens the Daily Brief page - requires Scrypted login',
-            group: 'Daily Brief',
+            group: 'General',
         },
         haCardSetup: {
             title: 'HA Card Setup',
             type: 'html',
             description: 'Instructions to add the Daily Brief card to Home Assistant',
-            group: 'Daily Brief',
+            group: 'Home Assistant',
         },
         dailyBriefEnabled: {
             title: 'Enable Daily Brief Notifications',
             type: 'boolean',
-            description: 'Send a notification with daily summary at scheduled time',
+            description: 'Optional: send a notification with the daily summary at the scheduled time.',
             defaultValue: false,
             group: 'Daily Brief',
         },
@@ -1661,7 +2102,7 @@ Avoid generic phrases like "motion detected" or "person detected"`,
         dailyBriefHour: {
             title: 'Notification Time (Hour)',
             type: 'number',
-            description: 'Hour to send daily brief (24h format, e.g., 20 = 8pm)',
+            description: 'Optional: hour to send the daily brief (24h format, e.g., 20 = 8pm). Only used when Enable Daily Brief Notifications is on.',
             defaultValue: 20,
             group: 'Daily Brief',
         },
@@ -1683,7 +2124,21 @@ Avoid generic phrases like "motion detected" or "person detected"`,
             type: 'string',
             description: 'URL to open when notification is tapped. Set to the HA dashboard path where your Daily Brief card lives.',
             defaultValue: '/daily-brief/0',
-            group: 'Daily Brief',
+            group: 'Home Assistant',
+        },
+        enablePerEventBriefClick: {
+            title: 'Open Event on Tap (HA only)',
+            type: 'boolean',
+            description: 'HA notifiers only: tapping an enhanced notification opens the dashboard (set above) at that event in the Activity tab. Scrypted iPhone/Mac notifications are unaffected — the Scrypted app\'s closed NVR SPA has no route for plugin pages.',
+            defaultValue: false,
+            group: 'Home Assistant',
+        },
+        haNvrTimelinePath: {
+            title: 'HA NVR Timeline Path',
+            type: 'string',
+            description: 'Optional: HA dashboard path that hosts a scrypted-nvr-iframe-card (e.g. /scrypted or /lovelace/scrypted/0). When set, the Daily Brief modal adds a "View in HA NVR Timeline" link that navigates HA to this path with ?camera=&time= query params — opens inside HA Companion (single tab on iPhone). Leave empty to disable the in-HA link; the Cloud "View in NVR Timeline" link remains either way.',
+            defaultValue: '',
+            group: 'Home Assistant',
         },
         dailyBriefGenerationInterval: {
             title: 'Background Generation Interval',
@@ -1696,22 +2151,22 @@ Avoid generic phrases like "motion detected" or "person detected"`,
         dailyBriefCustomPrompt: {
             title: 'Custom Instructions',
             type: 'textarea',
-            description: 'Add custom context for the Daily Brief. e.g. "The small white dog is Lily" or "Ignore cars on the Sidewalk camera"',
+            description: 'Add custom context for the Daily Brief. e.g. "The small white dog is Rex" or "Ignore cars on the Sidewalk camera"',
             defaultValue: '',
             group: 'Daily Brief',
         },
         retentionDays: {
-            title: 'Gallery Retention (Days)',
+            title: 'Activity Retention (Days)',
             type: 'number',
             description: 'How many days to keep notifications, posters, and embeddings (default: 3)',
             defaultValue: 3,
-            group: 'Daily Brief',
+            group: 'Activity',
         },
         geminiEmbeddingApiKey: {
             title: 'Gemini Embedding API Key',
-            description: 'API key for Gemini multimodal embeddings (gemini-embedding-2-preview). Enables high-quality semantic search using both image and text. Get a key at https://aistudio.google.com/apikey',
+            description: 'Optional: API key for Gemini multimodal embeddings (gemini-embedding-2-preview). Enables semantic search over both image and text; without it search falls back to keywords. Get a key at https://aistudio.google.com/apikey',
             type: 'password',
-            group: 'Search',
+            group: 'Activity',
         },
     });
 
@@ -1729,52 +2184,80 @@ Avoid generic phrases like "motion detected" or "person detected"`,
         // Populate Daily Brief URLs from cache (no network calls — fast getSettings)
         const urlSetting = byKey.get('dailyBriefUrl');
         if (urlSetting) {
+            const links: string[] = [];
             if (this.cachedLocalEndpoint) {
-                // Use relative path only — the SDK returns an absolute URL with IP:port
-                // but users may access Scrypted via hostname or reverse proxy
+                // Local link: relative path only — the SDK returns an absolute URL
+                // with IP:port but users may access Scrypted via hostname or reverse
+                // proxy on LAN. Relative URL resolves to whatever host the user is
+                // viewing this settings page from, which is the right local target.
                 const localPath = new URL(this.cachedLocalEndpoint).pathname.replace(/\/+$/, '');
-                const urlStr = `${localPath}/brief`;
-                urlSetting.value = `<a href="${urlStr}" target="_blank">Open Daily Brief</a>`;
-            } else {
-                urlSetting.value = '(URL not available yet)';
+                links.push(`<a href="${localPath}/brief" target="_blank">Open Daily Brief (local)</a>`);
             }
+            if (this.cachedCloudEndpoint) {
+                // Cloud link: absolute URL from the SDK. Works when this settings
+                // page is opened from a Scrypted Cloud admin host (where a relative
+                // URL would resolve against a host that doesn't proxy plugin
+                // endpoints — see GitHub Pages 404 reproducer 2026-05-04).
+                const cloudUrl = `${this.cachedCloudEndpoint.replace(/\/+$/, '')}/brief`;
+                links.push(`<a href="${cloudUrl}" target="_blank">Open Daily Brief (cloud)</a>`);
+            }
+            urlSetting.value = links.length > 0 ? links.join(' &middot; ') : '(URL not available yet)';
         }
 
 
         // Populate HA Card setup instructions
         const haSetupSetting = byKey.get('haCardSetup');
         if (haSetupSetting) {
+            // Link only. The YAML for both cards lives in the README's Home
+            // Assistant section — a settings panel is a poor place to read
+            // setup instructions, and duplicating them guarantees drift.
             haSetupSetting.value = `
 <div style="font-size: 12px; line-height: 1.5;">
-See <a href="https://github.com/rmaher001/scrypted-llm-notifier#ha-card-setup" target="_blank">README</a> for HA Card setup instructions.
+See the <a href="https://github.com/rmaher001/scrypted-llm-notifier#home-assistant" target="_blank">README</a>
+to add the Daily Brief card, and the optional NVR timeline card that the setting below points at.
 </div>`;
         }
 
+        // Every defined setting must appear here, or it falls through to the
+        // "leftovers" append below and lands in an arbitrary spot. A key that
+        // is NOT a setting resolves to nothing and is silently skipped — which
+        // is how 'promptUpdateInfo' survived here for months after its setting
+        // was removed. Both directions are asserted by
+        // tests/settings-organization.test.ts.
         const orderedKeys = [
-            // General first
+            // General — shared infrastructure
             'chatCompletions',
             'notificationLlm',
-            'promptUpdateInfo',
-            'userPrompt',
-            // Options (Advanced)
+            'dailyBriefUrl',
+            // Notifications
             'enabled',
-            'llmTimeoutMs',
+            'userPrompt',
             'snapshotMode',
             'includeOriginalMessage',
-            'groupingWindow',
+            'llmTimeoutMs',
             'enableLlmFaceId',
             // Daily Brief
-            'dailyBriefUrl',
-            'haCardSetup',
             'dailyBriefEnabled',
             'dailyBriefNotifier',
             'dailyBriefTestNotification',
-            'dailyBriefNotificationUrl',
             'dailyBriefTimezone',
             'dailyBriefHour',
             'dailyBriefGenerationInterval',
             'dailyBriefCustomPrompt',
+            // Activity
             'retentionDays',
+            'geminiEmbeddingApiKey',
+            // Home Assistant
+            'haCardSetup',
+            'dailyBriefNotificationUrl',
+            'enablePerEventBriefClick',
+            'haNvrTimelinePath',
+            // LLM Health
+            'llmTelemetryRetentionDays',
+            'llmJudgeSampleRate',
+            'llmJudgeProvider',
+            // Advanced
+            'verboseLogging',
         ];
         const ordered: any[] = [];
         for (const k of orderedKeys) {
@@ -1801,160 +2284,22 @@ See <a href="https://github.com/rmaher001/scrypted-llm-notifier#ha-card-setup" t
         if (key === 'dailyBriefGenerationInterval') {
             this.startDailyBriefTimer();
         } else if (key === 'dailyBriefEnabled' || key === 'dailyBriefHour' || key === 'dailyBriefTimezone') {
+            if (key === 'dailyBriefTimezone') {
+                this.notificationStore.setTimezone(String(value || '') || undefined);
+                this.notificationStore.pruneNow();
+            }
             this.scheduleDailySummary();
         } else if (key === 'retentionDays') {
-            this.notificationStore.setRetentionDays(Number(value) || 3);
+            const days = Number(value) || 3;
+            this.notificationStore.setRetentionDays(days);
             this.notificationStore.pruneNow();
             this.startPruneTimer();
-        } else if (key === 'groupingWindow') {
-            const windowSec = Math.max(0, Number(value) || 0);
-            await this.notificationBuffer?.flush();
-            if (windowSec > 0) {
-                this.notificationBuffer = new NotificationBuffer(
-                    windowSec * 1000,
-                    async (notifications, targets) => {
-                        await this.handleBufferFlush(notifications, targets);
-                    },
-                );
-                this.console.log(`[Grouping] Buffer updated: ${windowSec}s window`);
-            } else {
-                this.notificationBuffer = undefined;
-                this.console.log('[Grouping] Buffer disabled (instant delivery)');
-            }
         }
     }
 
     private async sendTestNotification() {
         this.console.log('[Daily Brief] Test notification triggered');
         await this.generateAndNotifySummary();
-    }
-
-    // ---- Notification Grouping (flush handler) ----
-
-    private async handleBufferFlush(
-        notifications: BufferedNotification[],
-        targets: DeliveryTarget[],
-    ): Promise<void> {
-        if (notifications.length === 1) {
-            // Single notification — deliver to each target with its own options/media/icon
-            const n = notifications[0];
-            const notifierTargets = targets.filter(t => t.notificationId === n.id);
-            for (const t of notifierTargets) {
-                try {
-                    await t.notifier.sendNotification(n.title, t.options, t.media, t.icon);
-                } catch (e) {
-                    this.console.warn(`[Grouping] Delivery failed for ${n.id}:`, e);
-                }
-            }
-            return;
-        }
-
-        // Multiple notifications — group via LLM
-        try {
-            const provider = this.selectProvider();
-            if (!provider) throw new Error('No LLM provider configured for notification grouping');
-            const groupStart = Date.now();
-            const groups = await groupNotifications(notifications, provider);
-            const groupLatencyMs = Date.now() - groupStart;
-
-            // Update store with group metadata and resolve primaries (single pass)
-            const groupPrimaries = new Map<NotificationGroup, BufferedNotification>();
-            for (const group of groups) {
-                const primaryId = this.pickPrimaryNotification(group.notificationIds, notifications);
-                const groupId = `group-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                this.notificationStore.updateGroup(group.notificationIds, groupId, primaryId);
-                groupPrimaries.set(
-                    group,
-                    notifications.find(n => n.id === primaryId)
-                        ?? notifications.find(n => group.notificationIds.includes(n.id))
-                        ?? notifications[0],
-                );
-            }
-
-            // Deliver each group — each notifier gets its own options/media/icon
-            // from its target for the primary notification (preserves device-specific
-            // metadata like data.ha for HA notifiers)
-            for (const group of groups) {
-                const primary = groupPrimaries.get(group)!;
-                const eventCount = group.notificationIds.length;
-                const deliveryTitle = eventCount > 1
-                    ? `${group.title} [${eventCount} events]`
-                    : group.title;
-
-                // Collect targets belonging to this group, grouped by notifier
-                const groupTargets = targets.filter(t => group.notificationIds.includes(t.notificationId));
-                const byNotifier = new Map<any, DeliveryTarget[]>();
-                for (const t of groupTargets) {
-                    const list = byNotifier.get(t.notifier) || [];
-                    list.push(t);
-                    byNotifier.set(t.notifier, list);
-                }
-
-                for (const [notifier, notifierTargets] of byNotifier) {
-                    // Prefer this notifier's target for the primary notification
-                    const target = notifierTargets.find(t => t.notificationId === primary.id)
-                        ?? notifierTargets[0];
-                    // Merge grouped content into a copy to avoid mutating shared references
-                    const mergedOptions = { ...target.options, subtitle: group.subtitle, body: group.body };
-                    try {
-                        await notifier.sendNotification(
-                            deliveryTitle,
-                            mergedOptions,
-                            target.media,
-                            target.icon,
-                        );
-                    } catch (e) {
-                        this.console.warn(`[Grouping] Group delivery failed:`, e);
-                    }
-                }
-            }
-
-            // Log detailed stats: camera breakdown, LLM latency, group details
-            const cameraBreakdown = new Map<string, number>();
-            for (const n of notifications) {
-                cameraBreakdown.set(n.cameraName, (cameraBreakdown.get(n.cameraName) || 0) + 1);
-            }
-            const cameraStr = Array.from(cameraBreakdown.entries())
-                .map(([cam, count]) => `${cam}:${count}`)
-                .join(', ');
-            const groupDetails = groups.map(g =>
-                `"${g.title}" (${g.notificationIds.length} events)`,
-            ).join(', ');
-            this.console.log(
-                `[Grouping] ${notifications.length} notifications → ${groups.length} groups ` +
-                `in ${groupLatencyMs}ms | cameras: ${cameraStr} | groups: ${groupDetails}`,
-            );
-        } catch (e) {
-            // Grouping LLM call failed — deliver all individually (delivery guarantee)
-            this.console.warn('[Grouping] LLM grouping failed, delivering individually:', e);
-            for (const n of notifications) {
-                const notifierTargets = targets.filter(t => t.notificationId === n.id);
-                for (const t of notifierTargets) {
-                    try {
-                        await t.notifier.sendNotification(n.title, t.options, t.media, t.icon);
-                    } catch (deliveryErr) {
-                        this.console.warn(`[Grouping] Fallback delivery failed for ${n.id}:`, deliveryErr);
-                    }
-                }
-            }
-        }
-    }
-
-    private pickPrimaryNotification(notificationIds: string[], notifications: BufferedNotification[]): string {
-        // Pick the notification with the highest clarity score
-        let bestId = notificationIds[0];
-        let bestScore = -1;
-
-        for (const n of notifications) {
-            if (notificationIds.includes(n.id) && n.clarity) {
-                if (n.clarity.score > bestScore) {
-                    bestScore = n.clarity.score;
-                    bestId = n.id;
-                }
-            }
-        }
-
-        return bestId;
     }
 
     selectProvider() {
@@ -1978,6 +2323,85 @@ See <a href="https://github.com/rmaher001/scrypted-llm-notifier#ha-card-setup" t
         this.currentNotificationProviderIndex = (this.currentNotificationProviderIndex + 1) % providerIds.length;
         const device = sdk.systemManager.getDeviceById(providerId) as ScryptedDevice & ChatCompletion;
         return resolveNotificationProvider(device, () => this.selectProvider());
+    }
+
+    // Selects the configured judge LLM device. Unset means judging is SKIPPED --
+    // see resolveJudgeProvider for why there is no fallback to the main provider.
+    private selectJudgeProvider(): (ScryptedDevice & ChatCompletion) | undefined {
+        const judgeId = (this.storageSettings.values as any).llmJudgeProvider as string | undefined;
+        return resolveJudgeProvider(judgeId, id =>
+            sdk.systemManager.getDeviceById(id) as (ScryptedDevice & ChatCompletion) | undefined);
+    }
+
+    // Fire-and-forget: sampled judge evaluation of a notification enrichment.
+    // Never throws, never awaited by caller. Writes a row to judgeLog on success.
+    maybeRunJudge(args: {
+        telemetryId: string;
+        enriched: {
+            title: string;
+            subtitle: string;
+            body: string;
+            detailedDescription: string;
+            identifiedPersons?: Array<{ name: string; confidence: number }> | null;
+        };
+        imageDataUrl: string;
+        referenceImages?: Map<string, string>;
+        verbose?: boolean;
+    }): void {
+        try {
+            const rateRaw = (this.storageSettings.values as any).llmJudgeSampleRate;
+            const rate = typeof rateRaw === 'number' ? rateRaw : parseFloat(String(rateRaw ?? 0));
+            if (!shouldSampleForJudging(rate)) return;
+
+            if (!args.imageDataUrl || !args.imageDataUrl.startsWith('data:image')) {
+                if (args.verbose) this.console.log('[Judge] Skipping — no inline image data URL');
+                return;
+            }
+
+            const provider = this.selectJudgeProvider();
+            if (!provider) {
+                // NOT gated on verboseLogging (default off). This is the only
+                // signal a user gets that Judge Sample Rate is set but inert,
+                // and the LLM Health Judge panel simply vanishes rather than
+                // explaining itself. Latched so it says it once per load.
+                if (!this.judgeInertWarned) {
+                    this.judgeInertWarned = true;
+                    // Covers both inert states: nothing selected, and a
+                    // selected device that no longer exists (deleted/renamed).
+                    this.console.warn('[Judge] Judge Sample Rate is above 0 but the Judge LLM Provider is not set, or the selected device no longer exists — nothing is being graded. Pick a provider in settings; a judge is never chosen for you.');
+                }
+                return;
+            }
+
+            const claimedPersonNames = (args.enriched.identifiedPersons || []).map(p => p.name);
+            const refImages = new Map<string, string>();
+            if (args.referenceImages) {
+                for (const name of claimedPersonNames) {
+                    const img = args.referenceImages.get(name);
+                    if (img) refImages.set(name, img);
+                }
+            }
+
+            const input: JudgeInput = {
+                imageDataUrl: args.imageDataUrl,
+                subjectTitle: args.enriched.title,
+                subjectSubtitle: args.enriched.subtitle,
+                subjectBody: args.enriched.body,
+                subjectDetailedDescription: args.enriched.detailedDescription,
+                claimedPersonNames,
+                referenceImages: refImages,
+            };
+
+            const timeoutMs = Math.max(1, Number((this.storageSettings.values as any).llmTimeoutMs ?? 90)) * 1000;
+
+            // Fire-and-forget.
+            runJudge({ subjectId: args.telemetryId, provider, input, timeoutMs })
+                .then(row => this.judgeLog.append(row))
+                .then(() => { if (args.verbose) this.console.log(`[Judge] Recorded evaluation for ${args.telemetryId}`); })
+                .catch(err => this.console.warn('[Judge] Evaluation failed:', err));
+        } catch (err) {
+            try { this.console.warn('[Judge] Setup failed:', err); } catch { /* ignore */ }
+        }
     }
 
     async canMixin(type: ScryptedDeviceType, interfaces: string[]) {

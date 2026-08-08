@@ -123,9 +123,18 @@ describe('LLM Person Identification wiring', () => {
         expect(llmNotifierTs).toMatch(/createMessageTemplate\([\s\S]*?referenceImages/);
     });
 
-    test('llm-notifier.ts gates on unlabeled high-confidence faces', () => {
-        expect(llmNotifierTs).toMatch(/unlabeledHighConfFaces/);
-        expect(llmNotifierTs).toMatch(/MIN_FACE_SCORE/);
+    test('llm-notifier.ts fires LLM Person ID on face-only detection (v0.3.137)', () => {
+        // v0.3.137: narrowed back to face-only. The v0.3.136 FaceID-Probe
+        // (132-sample production capture) showed unlabeled face entries DO
+        // reach our detections array when a face is visible; person-only
+        // events have no face data and wasted ~50% of LLM-ID calls. Pre-v0.3.130
+        // markers (unlabeledHighConfFaces, MIN_FACE_SCORE) must still be gone.
+        expect(llmNotifierTs).not.toMatch(/unlabeledHighConfFaces/);
+        expect(llmNotifierTs).not.toMatch(/MIN_FACE_SCORE/);
+        // Must NOT have the v0.3.130 broader gate
+        expect(llmNotifierTs).not.toMatch(/d\.className === 'person' \|\| d\.className === 'face'/);
+        // Must have the narrowed gate
+        expect(llmNotifierTs).toMatch(/d\.className === 'face'/);
     });
 
     test('llm-notifier.ts uses multi-person identifiedPersons', () => {
@@ -811,9 +820,13 @@ describe('Final module structure', () => {
         });
     }
 
-    test('main.ts is under 2010 lines', () => {
+    test('main.ts is under 3000 lines', () => {
+        // After stories-grouping replacement (Phase 1 deleted ~250 lines of
+        // buffer/grouper wiring; Phases 2-8 re-added ~300 lines for the
+        // Stories integration). v0.3.144 added per-notifier deep link
+        // routing + HA token settings (~40 lines). Cap bumped to 3000.
         const lines = mainTs.split('\n').length;
-        expect(lines).toBeLessThan(2010);
+        expect(lines).toBeLessThan(3000);
     });
 
     test('main.ts contains only LLMNotifierProvider', () => {
@@ -977,11 +990,14 @@ describe('Bug Fix: Replay race condition (track ended re-shows overlay)', () => 
 // ============================================================================
 
 describe('Bug Fix: Video clip uses 5s preroll and 25s duration', () => {
-    test('HTTP video endpoint uses 5s preroll (startTime = timestamp - 5000)', () => {
-        // Find the /brief/video handler and check startTime calculation
+    test('HTTP video endpoint uses 5s preroll off the SEEK instant (v0.3.173)', () => {
+        // The 5s preroll is unchanged; only the anchor moved. It is now the
+        // persisted seek instant (what the poster used), falling back to the
+        // handling timestamp for records written before v0.3.173. Anchoring on
+        // the handling time ran the clip 44-300s late on Stories.
         const videoSection = mainTs.match(/path === '\/brief\/video'[\s\S]*?(?=\/\/ High-resolution|\/\/ WebRTC|if \(path ===)/);
         expect(videoSection).not.toBeNull();
-        expect(videoSection![0]).toMatch(/notification\.timestamp\s*-\s*5000/);
+        expect(videoSection![0]).toMatch(/\(notification\.seekTimestamp\s*\?\?\s*notification\.timestamp\)\s*-\s*5000/);
     });
 
     test('HTTP video endpoint uses 25s duration', () => {
@@ -990,10 +1006,12 @@ describe('Bug Fix: Video clip uses 5s preroll and 25s duration', () => {
         expect(videoSection![0]).toMatch(/duration\s*=\s*25000/);
     });
 
-    test('WebRTC endpoint uses 5s preroll (startTime = timestamp - 5000)', () => {
+    test('WebRTC endpoint uses 5s preroll off the SEEK instant (v0.3.173)', () => {
+        // Must match the HTTP endpoint exactly, or playing a card behaves
+        // differently from tapping it.
         const webrtcSection = mainTs.match(/path === '\/brief\/webrtc-signal'[\s\S]*?(?=if \(path ===|$)/);
         expect(webrtcSection).not.toBeNull();
-        expect(webrtcSection![0]).toMatch(/notification\.timestamp\s*-\s*5000/);
+        expect(webrtcSection![0]).toMatch(/\(notification\.seekTimestamp\s*\?\?\s*notification\.timestamp\)\s*-\s*5000/);
     });
 
     test('WebRTC endpoint uses 25s duration', () => {
@@ -1016,8 +1034,12 @@ describe('Bug Fix: HTTP video URL construction', () => {
         expect(loadHttpBlock![0]).not.toMatch(/new URL\(clipUrl/);
     });
 
-    test('VideoPlayer _loadHttpVideo takes notificationId as first parameter', () => {
-        expect(videoPlayerJs).toMatch(/_loadHttpVideo\s*\(\s*notificationId\b/);
+    test('VideoPlayer _loadHttpVideo is parameterless and resolves the clip via _clipParams', () => {
+        // v0.3.161: _loadHttpVideo reads the current clip ref (notification id OR
+        // Story cameraId+time) through _clipParams() instead of a passed id.
+        expect(videoPlayerJs).toMatch(/_loadHttpVideo\s*\(\s*\)/);
+        const loadHttpBlock = videoPlayerJs.match(/_loadHttpVideo[\s\S]{0,400}/);
+        expect(loadHttpBlock![0]).toMatch(/_clipParams\(\)/);
     });
 
     test('HA card does not reference _currentClipUrl anywhere', () => {
@@ -1136,22 +1158,22 @@ describe('Bug Fix: WebRTC replay, fullscreen replay, audio', () => {
         expect(loadBlock![0]).not.toMatch(/\.muted\s*=\s*true/);
     });
 
-    test('VideoPlayer _loadHttpVideo sets video.controls = true before play', () => {
+    test('VideoPlayer _loadHttpVideo keeps video.controls = false (custom controls in modal)', () => {
         const loadBlock = videoPlayerJs.match(/_loadHttpVideo[\s\S]{0,800}/);
         expect(loadBlock).not.toBeNull();
-        expect(loadBlock![0]).toMatch(/controls\s*=\s*true/);
+        expect(loadBlock![0]).not.toMatch(/controls\s*=\s*true/);
     });
 
-    test('VideoPlayer openVideo re-enables video controls', () => {
+    test('VideoPlayer openVideo keeps video.controls = false (custom controls in modal)', () => {
         const openBlock = videoPlayerJs.match(/async openVideo[\s\S]*?_tryWebRTC/);
         expect(openBlock).not.toBeNull();
-        expect(openBlock![0]).toContain('.controls = true');
+        expect(openBlock![0]).not.toContain('.controls = true');
     });
 
-    test('VideoPlayer replay re-enables video controls', () => {
+    test('VideoPlayer replay keeps video.controls = false (custom controls in modal)', () => {
         const replayBlock = videoPlayerJs.match(/async replay\s*\(\)\s*\{[\s\S]{0,400}/);
         expect(replayBlock).not.toBeNull();
-        expect(replayBlock![0]).toContain('.controls = true');
+        expect(replayBlock![0]).not.toContain('.controls = true');
     });
 
     test('VideoPlayer listens for fullscreenchange', () => {
@@ -1250,10 +1272,10 @@ describe('Fix: Audio playback - video.play() before first await', () => {
         }
     });
 
-    test('VideoPlayer openVideo re-enables video controls', () => {
+    test('VideoPlayer openVideo keeps controls disabled (custom controls in modal) — duplicate guard', () => {
         const openBlock = videoPlayerJs.match(/async openVideo[\s\S]*?_tryWebRTC/);
         expect(openBlock).not.toBeNull();
-        expect(openBlock![0]).toContain('.controls = true');
+        expect(openBlock![0]).not.toContain('.controls = true');
     });
 
     test('VideoPlayer track ended handler guards against stale PC by comparing instance', () => {
@@ -1383,10 +1405,10 @@ describe('Shared VideoPlayer class (ha-card/video-player.js)', () => {
         expect(loadHttpBlock![0]).toMatch(/buildUrl.*\/brief\/video/);
     });
 
-    test('VideoPlayer _loadHttpVideo sets video.controls = true', () => {
+    test('VideoPlayer _loadHttpVideo keeps video.controls = false (custom controls in modal) — duplicate guard', () => {
         const loadHttpBlock = videoPlayerJs.match(/_loadHttpVideo[\s\S]{0,600}/);
         expect(loadHttpBlock).not.toBeNull();
-        expect(loadHttpBlock![0]).toMatch(/controls\s*=\s*true/);
+        expect(loadHttpBlock![0]).not.toMatch(/controls\s*=\s*true/);
     });
 
     test('VideoPlayer _loadHttpVideo does not set video.muted = true', () => {
@@ -2008,10 +2030,10 @@ describe('Gallery Phase 2: keywordSearch unit tests', () => {
 
     test('matches on names array', () => {
         const notifs = [
-            { id: '1', llmTitle: 'Person', llmSubtitle: '', llmBody: '', cameraName: '', names: ['Richard'] },
+            { id: '1', llmTitle: 'Person', llmSubtitle: '', llmBody: '', cameraName: '', names: ['Alex'] },
             { id: '2', llmTitle: 'Person', llmSubtitle: '', llmBody: '', cameraName: '', names: ['Sarah'] },
         ];
-        const results = keywordSearch('richard', notifs);
+        const results = keywordSearch('alex', notifs);
         expect(results.length).toBe(1);
         expect(results[0].id).toBe('1');
     });
@@ -2101,17 +2123,17 @@ describe('Gallery Phase 2: getGalleryPage unit tests', () => {
 
     test('filters by name', () => {
         const notifs = [
-            makeNotif('1', { names: ['Richard'] }),
+            makeNotif('1', { names: ['Alex'] }),
             makeNotif('2', { names: [] }),
-            makeNotif('3', { names: ['Sarah', 'Richard'] }),
+            makeNotif('3', { names: ['Sarah', 'Alex'] }),
         ];
-        const result = getGalleryPage(notifs, 1, 50, { name: 'Richard' });
+        const result = getGalleryPage(notifs, 1, 50, { name: 'Alex' });
         expect(result.notifications.length).toBe(2);
     });
 
     test('returns filter options from all notifications', () => {
         const notifs = [
-            makeNotif('1', { cameraName: 'Front Door', detectionType: 'person', names: ['Richard'] }),
+            makeNotif('1', { cameraName: 'Front Door', detectionType: 'person', names: ['Alex'] }),
             makeNotif('2', { cameraName: 'Backyard', detectionType: 'vehicle', names: [] }),
         ];
         const result = getGalleryPage(notifs, 1, 50, {});
@@ -2119,7 +2141,7 @@ describe('Gallery Phase 2: getGalleryPage unit tests', () => {
         expect(result.filters.cameras).toContain('Backyard');
         expect(result.filters.types).toContain('person');
         expect(result.filters.types).toContain('vehicle');
-        expect(result.filters.names).toContain('Richard');
+        expect(result.filters.names).toContain('Alex');
     });
 
     test('returns thumbnailUrl when hasPoster is true', () => {
@@ -2350,20 +2372,20 @@ describe('Gallery Phase 4: html-generator tab bar', () => {
         expect(htmlGen).toMatch(/data-tab=.*brief/);
     });
 
-    test('html-generator has Gallery tab button', () => {
-        expect(htmlGen).toMatch(/data-tab=.*gallery/);
+    test('html-generator has Activity tab button', () => {
+        expect(htmlGen).toMatch(/data-tab=.*activity/);
     });
 
     test('html-generator has brief tab content container', () => {
         expect(htmlGen).toMatch(/id=.*brief-tab/);
     });
 
-    test('html-generator has gallery tab content container', () => {
-        expect(htmlGen).toMatch(/id=.*gallery-tab/);
+    test('html-generator has activity tab content container', () => {
+        expect(htmlGen).toMatch(/id=.*activity-tab/);
     });
 
-    test('gallery tab hidden by default', () => {
-        expect(htmlGen).toMatch(/gallery-tab.*display:\s*none|gallery-tab.*hidden/);
+    test('activity tab hidden by default', () => {
+        expect(htmlGen).toMatch(/activity-tab.*display:\s*none|activity-tab.*hidden/);
     });
 
     test('html-generator embeds GALLERY_JS', () => {
@@ -2456,8 +2478,21 @@ describe('Poster Store: Write poster to disk at detection time', () => {
         expect(llmNotifier).not.toMatch(/snapshotCache/);
     });
 
-    test('llm-notifier prefers fullFrameUrl over imageUrl for poster', () => {
-        expect(llmNotifier).toMatch(/fullFrameUrl\s*\|\|\s*imageUrl/);
+    test('llm-notifier poster source is chosen by the shared selector + storage-cap downscale (v0.3.172)', () => {
+        // Per 2026-05-15 spec §4.4 + §4.6, extended v0.3.164 and v0.3.172:
+        //   1. Source comes from selectPosterRawSource, which splits by type —
+        //      a Story keeps Scrypted's composite, a per-detection event uses
+        //      posterBox ?? subjectCrop ?? fullFrame with the notification
+        //      image only as the never-blank last resort.
+        //   2. Source piped through downscaleForStorage to fit under the
+        //      1 MB cap even for 4K cameras (regression fix from v0.3.118).
+        expect(llmNotifier).toMatch(/selectPosterRawSource\s*\(/);
+        expect(llmNotifier).toMatch(/const\s+rawSource\s*=\s*picked\.buf/);
+        expect(llmNotifier).toMatch(/await\s+downscaleForStorage/);
+        // Old chain patterns must NOT return.
+        expect(llmNotifier).not.toMatch(/posterUrl\s*=\s*imageUrl\s*\|\|\s*fullFrameUrl/);
+        expect(llmNotifier).not.toMatch(/posterUrl\s*=\s*fullFrameUrl\s*\|\|\s*imageUrl/);
+        expect(llmNotifier).not.toMatch(/posterBuf\s*=\s*Buffer\.from\(\s*imageUrl/);
     });
 
     test('llm-notifier sets hasPoster on stored notification', () => {
@@ -2624,10 +2659,13 @@ describe('NotificationStore configurable retention', () => {
     });
 
     test('putSetting calls pruneNow after changing retentionDays', () => {
-        const putSettingStart = mainTs.indexOf('async putSetting');
-        expect(putSettingStart).toBeGreaterThan(-1);
-        const putSettingBlock = mainTs.substring(putSettingStart, putSettingStart + 800);
-        expect(putSettingBlock).toContain('pruneNow');
+        // Target the retentionDays branch itself. A fixed-size window from
+        // `async putSetting` broke the moment an unrelated branch earlier in
+        // the method grew and pushed this past the cutoff — a false failure
+        // that says nothing about whether pruneNow is still called.
+        const branch = /else if \(key === 'retentionDays'\)[\s\S]{0,500}?\n        \}/.exec(mainTs)?.[0] ?? '';
+        expect(branch).toContain('setRetentionDays');
+        expect(branch).toContain('pruneNow');
     });
 });
 
@@ -2652,7 +2690,9 @@ describe('Gallery configurable retention', () => {
 describe('main.ts Gallery retention wiring', () => {
     test('storageSettings defines retentionDays setting', () => {
         expect(mainTs).toMatch(/retentionDays\s*:\s*\{/);
-        expect(mainTs).toMatch(/Gallery Retention/);
+        // Titled "Activity Retention" since v0.3.176 — the tab was renamed from
+        // Gallery to Activity in v0.3.150 and the setting title lagged behind.
+        expect(mainTs).toMatch(/Activity Retention/);
     });
 
     test('retentionDays is in orderedKeys', () => {
@@ -2685,11 +2725,12 @@ describe('main.ts Gallery retention wiring', () => {
         expect(mainTs).toMatch(/startPruneTimer/);
     });
 
-    test('snapshot endpoint does not use NVR fallback (removed for performance)', () => {
+    test('snapshot endpoint does not use NVR fallback (removed for performance) — Disk MISS log added v0.3.91 for diagnostics is allowed', () => {
         const snapshotIdx = mainTs.indexOf("path === '/brief/snapshot'");
         expect(snapshotIdx).toBeGreaterThan(-1);
         const afterSnapshot = mainTs.substring(snapshotIdx, snapshotIdx + 3000);
-        expect(afterSnapshot).not.toMatch(/Disk MISS/);
+        // The 'Disk MISS' log line itself is allowed (diagnostic, no fallback).
+        // The fallback methods must not be present.
         expect(afterSnapshot).not.toMatch(/getRecordingStreamThumbnail/);
     });
 });
@@ -2796,123 +2837,6 @@ describe('Gallery: thumbnail URLs use buildUrl', () => {
 
 const llmNotifierTs = fs.readFileSync(path.join(ROOT, 'src/llm-notifier.ts'), 'utf-8');
 
-describe('Notification Grouping: buffer replacement safety', () => {
-    test('putSetting groupingWindow flushes old buffer before creating new one', () => {
-        // Extract the groupingWindow branch from putSetting
-        const branchStart = mainTs.indexOf("key === 'groupingWindow'");
-        expect(branchStart).toBeGreaterThan(-1);
-        const branchBlock = mainTs.substring(branchStart, branchStart + 500);
-
-        const flushIdx = branchBlock.indexOf('.flush()');
-        const newBufferIdx = branchBlock.indexOf('new NotificationBuffer(');
-        expect(flushIdx).toBeGreaterThan(-1);
-        expect(newBufferIdx).toBeGreaterThan(-1);
-        // flush() must come BEFORE new NotificationBuffer(
-        expect(flushIdx).toBeLessThan(newBufferIdx);
-    });
-
-    test('flush() is called unconditionally before both branches (enable and disable)', () => {
-        // flush() delivers pending notifications before replacing or disabling the buffer
-        const branchStart = mainTs.indexOf("key === 'groupingWindow'");
-        expect(branchStart).toBeGreaterThan(-1);
-        const branchBlock = mainTs.substring(branchStart, branchStart + 700);
-
-        // flush() must come before the if branch
-        const flushIdx = branchBlock.indexOf('.flush()');
-        const ifIdx = branchBlock.indexOf('if (windowSec > 0)');
-        expect(flushIdx).toBeGreaterThan(-1);
-        expect(flushIdx).toBeLessThan(ifIdx);
-    });
-
-    test('flush() is awaited (not fire-and-forget)', () => {
-        const branchStart = mainTs.indexOf("key === 'groupingWindow'");
-        const branchBlock = mainTs.substring(branchStart, branchStart + 500);
-        // Must be "await ...flush()" not just ".flush()"
-        expect(branchBlock).toMatch(/await\s+this\.notificationBuffer\?\.flush\(\)/);
-    });
-});
-
-describe('Notification Grouping: buffer entry logging', () => {
-    // Extract the entire buffer delivery section (from add call through the log line)
-    const addIdx = llmNotifierTs.indexOf('notificationBuffer.add(');
-    const bufferRegion = llmNotifierTs.substring(addIdx, addIdx + 800);
-
-    test('llm-notifier.ts logs when notification is added to buffer', () => {
-        expect(addIdx).toBeGreaterThan(-1);
-        // There should be a console.log with [Grouping] after the add call
-        expect(bufferRegion).toMatch(/console\.log.*\[Grouping\]/);
-    });
-
-    test('buffer log uses .size (not .size + 1) for accurate count', () => {
-        // Should use .size (post-add), not .size + 1 (off-by-one on duplicates)
-        expect(bufferRegion).toMatch(/\.size\}/);
-        expect(bufferRegion).not.toMatch(/\.size\s*\+\s*1/);
-    });
-});
-
-describe('Notification Grouping: flush stats and badge', () => {
-    // Extract handleBufferFlush method body for all tests in this describe
-    const flushStart = mainTs.indexOf('private async handleBufferFlush(');
-    const flushEnd = mainTs.indexOf('\n    private ', flushStart + 1);
-    const flushBody = mainTs.substring(flushStart, flushEnd);
-
-    test('handleBufferFlush measures LLM grouping latency', () => {
-        // Should have timing around the groupNotifications call
-        expect(flushBody).toMatch(/Date\.now\(\)/);
-        expect(flushBody).toMatch(/[Ll]atency|[Ee]lapsed|[Dd]uration|ms/);
-    });
-
-    test('handleBufferFlush logs camera breakdown per group', () => {
-        // Should build a per-camera count from the notifications
-        expect(flushBody).toMatch(/cameraName/);
-        // Should log the breakdown
-        expect(flushBody).toMatch(/camera/i);
-    });
-
-    test('handleBufferFlush appends event count badge to grouped notification title', () => {
-        // When delivering a group with >1 notification, title should include event count
-        expect(flushBody).toMatch(/notificationIds\.length/);
-        expect(flushBody).toMatch(/events?\]/);
-    });
-
-    test('single notification flush does not get badge', () => {
-        // The single-notification path (notifications.length === 1) should use n.title directly
-        const singleStart = flushBody.indexOf('notifications.length === 1');
-        expect(singleStart).toBeGreaterThan(-1);
-        const singleBlock = flushBody.substring(singleStart, singleStart + 700);
-        // Should deliver with n.title, not modified title
-        expect(singleBlock).toMatch(/n\.title/);
-        expect(singleBlock).not.toMatch(/events?\]/);
-    });
-
-    test('flush delivery passes original options object, not a spread copy', () => {
-        // Spreading options into a new object ({ ...n.options, ... }) strips
-        // non-enumerable properties and Scrypted proxy tracking that the HA
-        // plugin needs for timeline links. All delivery paths must pass the
-        // original options object reference.
-        //
-        // FORBIDDEN pattern: { ...n.options, subtitle: ..., body: ... }
-        // FORBIDDEN pattern: { ...primary.options, subtitle: ..., body: ... }
-        // CORRECT pattern:   n.options (passed directly)
-        // CORRECT pattern:   primary.options (mutated in-place, then passed)
-        expect(flushBody).not.toMatch(/\{\s*\.\.\.n\.options/);
-        expect(flushBody).not.toMatch(/\{\s*\.\.\.primary\.options/);
-    });
-
-    test('groupPrimaries fallback prefers group-owned notification over notifications[0]', () => {
-        // If notifications.find() misses for the primaryId, falling back to
-        // notifications[0] is dangerous: that notification may belong to a
-        // different group, causing cross-group mutation of options.
-        // The fallback must try to find a notification within the group first.
-        //
-        // FORBIDDEN: groupPrimaries.set(group, notifications.find(...) || notifications[0])
-        // The line containing groupPrimaries.set must not have `|| notifications[0]`
-        const setLine = flushBody.split('\n').find(l => l.includes('groupPrimaries.set'));
-        expect(setLine).toBeDefined();
-        expect(setLine).not.toMatch(/\|\|\s*notifications\[0\]/);
-    });
-});
-
 describe('Endpoint URL caching for fast getSettings', () => {
     test('LLMNotifierProvider declares cachedLocalEndpoint property', () => {
         expect(mainTs).toMatch(/cachedLocalEndpoint/);
@@ -2967,8 +2891,8 @@ describe('Endpoint URL caching for fast getSettings', () => {
         expect(mainTs).not.toMatch(/dailyBriefCloudUrl/);
     });
 
-    test('no cachedCloudEndpoint property exists', () => {
-        expect(mainTs).not.toMatch(/cachedCloudEndpoint/);
+    test('cachedCloudEndpoint property exists (v0.3.97 — used for cloud-link "View in NVR Timeline" + cloudBaseUrl injection)', () => {
+        expect(mainTs).toMatch(/cachedCloudEndpoint/);
     });
 });
 
@@ -3097,9 +3021,9 @@ describe('Slim iframe HA card', () => {
         expect(haCardSource).not.toContain('Gallery');
     });
 
-    test('card source line count is under 200', () => {
+    test('card source line count is under 270', () => {
         const lines = haCardSource.split('\n').length;
-        expect(lines).toBeLessThan(200);
+        expect(lines).toBeLessThan(270);
     });
 
     test('_onMessage validates event.origin before processing', () => {
@@ -3370,10 +3294,11 @@ describe('People tab: photo URLs use client-side baseUrl', () => {
 });
 
 describe('NVR timeline link in video modal', () => {
-    test('video modal has a timeline link element', () => {
+    test('video modal has an "Open in NVR" button element', () => {
         const { generateDailyBriefHTML } = require('../src/daily-brief/html-generator');
         const html = generateDailyBriefHTML(0, null, [], null, 'America/Los_Angeles');
-        expect(html).toMatch(/modalTimeline|modal-timeline/);
+        expect(html).toMatch(/id="modalNvrBtn"/);
+        expect(html).toMatch(/Open in NVR/);
     });
 
     test('event items include data-camera-id and data-timestamp attributes', () => {

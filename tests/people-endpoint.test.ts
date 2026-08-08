@@ -18,8 +18,8 @@ function createMockPersonStore(people: Array<{ name: string; clarityScore: numbe
 
 describe('handlePeopleRequest', () => {
     const basePeople = [
-        { name: 'Richard', clarityScore: 8, cameraName: 'Front Door', updatedAt: 1710100000000 },
-        { name: 'Olesia', clarityScore: 6, cameraName: 'Driveway', updatedAt: 1710200000000 },
+        { name: 'Alex', clarityScore: 8, cameraName: 'Front Door', updatedAt: 1710100000000 },
+        { name: 'Blake', clarityScore: 6, cameraName: 'Driveway', updatedAt: 1710200000000 },
     ];
 
     it('returns correct JSON shape', async () => {
@@ -41,7 +41,7 @@ describe('handlePeopleRequest', () => {
         const body = JSON.parse(result.body);
 
         expect(body.people[0].photoUrl).toContain('/api/endpoint/brief/people/photo?name=');
-        expect(body.people[0].photoUrl).toContain('Richard');
+        expect(body.people[0].photoUrl).toContain('Alex');
     });
 
     it('includes person metadata fields', async () => {
@@ -49,10 +49,10 @@ describe('handlePeopleRequest', () => {
         const result = await handlePeopleRequest(store, true, '/base');
         const body = JSON.parse(result.body);
 
-        const richard = body.people.find((p: any) => p.name === 'Richard');
-        expect(richard.clarityScore).toBe(8);
-        expect(richard.cameraName).toBe('Front Door');
-        expect(richard.updatedAt).toBe(1710100000000);
+        const alex = body.people.find((p: any) => p.name === 'Alex');
+        expect(alex.clarityScore).toBe(8);
+        expect(alex.cameraName).toBe('Front Door');
+        expect(alex.updatedAt).toBe(1710100000000);
     });
 
     it('returns featureEnabled: false when feature off, still returns people list', async () => {
@@ -78,10 +78,10 @@ describe('handlePeoplePhotoRequest', () => {
     const jpegBuffer = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]); // JPEG magic bytes
 
     it('returns JPEG Buffer for known name', async () => {
-        const photos = new Map([['richard', jpegBuffer]]);
+        const photos = new Map([['alex', jpegBuffer]]);
         const store = createMockPersonStore([], photos);
         const result = await handlePeoplePhotoRequest(
-            'http://localhost/brief/people/photo?name=Richard',
+            'http://localhost/brief/people/photo?name=Alex',
             store,
         );
 
@@ -119,11 +119,11 @@ describe('handlePeopleDeleteRequest', () => {
             remove: jest.fn().mockResolvedValue(true),
         } as any;
         const result = await handlePeopleDeleteRequest(
-            'http://localhost/brief/people/delete?name=Richard',
+            'http://localhost/brief/people/delete?name=Alex',
             store,
         );
         expect(result.code).toBe(200);
-        expect(store.remove).toHaveBeenCalledWith('Richard');
+        expect(store.remove).toHaveBeenCalledWith('Alex');
     });
 
     it('returns 404 when person not found', async () => {

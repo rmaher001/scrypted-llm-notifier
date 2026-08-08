@@ -6,7 +6,7 @@ import * as fsp from 'fs/promises';
 import * as path from 'path';
 
 export interface PersonReference {
-    name: string;                 // Original casing ("Richard")
+    name: string;                 // Original casing ("Alex")
     clarityScore: number;         // General image clarity score (legacy)
     faceReferenceScore?: number;  // Face-specific reference quality (1-10)
     updatedAt: number;            // Timestamp when reference was last updated

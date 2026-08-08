@@ -154,10 +154,4 @@ describe('Daily Brief and grouping still use selectProvider', () => {
         expect(dailyBriefSection).toBeTruthy();
     });
 
-    it('handleBufferFlush uses selectProvider for grouping', () => {
-        const groupingSection = mainSrc.match(
-            /handleBufferFlush[\s\S]*?this\.selectProvider\(\)/
-        );
-        expect(groupingSection).toBeTruthy();
-    });
 });

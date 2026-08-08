@@ -242,7 +242,10 @@ describe('Gemini embedding integration', () => {
     test('main.ts has geminiEmbeddingApiKey setting with password type', () => {
         const mainTs = fs.readFileSync(path.join(ROOT, 'src/main.ts'), 'utf-8');
         expect(mainTs).toContain('geminiEmbeddingApiKey');
-        expect(mainTs).toMatch(/group:\s*['"]Search['"]/);
+        // Lives in the Activity group — it powers that tab's search. The old
+        // one-item 'Search' group was folded in during the v0.3.176 regroup.
+        const keyBlock = /geminiEmbeddingApiKey:\s*\{[\s\S]*?\n {8}\}/.exec(mainTs)?.[0] ?? '';
+        expect(keyBlock).toMatch(/group:\s*['"]Activity['"]/);
         // API key should be masked in UI
         const settingBlock = mainTs.match(/geminiEmbeddingApiKey:\s*\{[\s\S]*?\}/);
         expect(settingBlock).not.toBeNull();

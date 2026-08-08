@@ -16,6 +16,51 @@ export const PERIOD_NAMES: [number, string][] = [
     [18, 'evening'],   // 6pm-12am
 ];
 
+// Display names. 'night' stays the internal name — it is baked into persisted
+// frozen-segment keys — but "Thursday night" READS as Thursday evening, so the
+// 12am-6am block shows as "early morning" (UX report 2026-08-06).
+const PERIOD_DISPLAY: Record<string, string> = {
+    night: 'early morning',
+};
+
+/**
+ * Heals a persisted timeRange for display. Frozen segments written before the
+ * rename carry "Thursday night" verbatim and the renderer reuses them as-is,
+ * so without this the upgrade looks like it failed until the period ages out.
+ * Word-bounded and case-insensitive ("Night" appears in capitalized headers);
+ * "nightly"/"midnight" are left alone.
+ */
+export function toDisplayTimeRange(timeRange: string): string {
+    return timeRange.replace(/\bnight\b/gi, PERIOD_DISPLAY.night);
+}
+
+/**
+ * Consolidates a period's narrative segments into exactly ONE segment — total
+ * over any input, including an EMPTY array.
+ *
+ * Issue #12: the caller did `periodNarrative[0]` and dereferenced the result.
+ * Empty input is a live condition (JSON parse-failure fallback carries no
+ * narrative; the segment validator can filter everything out), and the
+ * resulting TypeError aborted the entire generation run — every remaining
+ * period, not just this one. Empty input now degrades to the same empty-period
+ * shape the no-candidates path produces, so downstream `.text` filters treat
+ * both identically and the loop continues.
+ */
+export function consolidatePeriodNarrative(
+    segments: NarrativeSegment[],
+    periodLabel: string,
+): NarrativeSegment {
+    if (segments.length === 0)
+        return { timeRange: periodLabel, text: '', highlightIds: [] };
+    if (segments.length === 1)
+        return segments[0];
+    return {
+        timeRange: periodLabel,
+        text: segments.map(s => s.text).join(' '),
+        highlightIds: [...new Set(segments.flatMap(s => s.highlightIds))],
+    };
+}
+
 /**
  * Returns all 6-hour natural periods that overlap [windowStart, windowEnd].
  * Periods are aligned to midnight in the given timezone.
@@ -67,7 +112,7 @@ export function getNaturalPeriods(windowStart: number, windowEnd: number, timezo
 
             periods.push({
                 key: `${dateKey}-${periodName}`,
-                label: `${dayName} ${periodName}`,
+                label: `${dayName} ${PERIOD_DISPLAY[periodName] ?? periodName}`,
                 start: cursor,
                 end: periodEnd,
             });
@@ -114,8 +159,11 @@ export function matchSegmentToPeriod(
 export function buildFrozenContext(frozenSegments: FrozenSegment[]): string {
     if (frozenSegments.length === 0) return '';
 
+    // Heal persisted timeRanges here too: this text is the model's own
+    // history, and a stale "Thursday night" in it invites the model to echo
+    // the retired vocabulary into fresh prose under a corrected header.
     const lines = frozenSegments.map(fs =>
-        `${fs.narrative.timeRange}: ${fs.narrative.text} (${fs.highlights.length} highlights)`
+        `${toDisplayTimeRange(fs.narrative.timeRange)}: ${fs.narrative.text} (${fs.highlights.length} highlights)`
     );
     return lines.join('\n');
 }
@@ -218,10 +266,10 @@ JOURNEYS (sequences of same subject moving through house):
   * Same camera + same time = same moment = pick ONE only
   * Same time + different cameras = same moment different angles = pick BEST one
 - Examples of ONE journey (include all):
-  * "Zoia enters walkway [2:00] → opens gate [2:01] → front door [2:02] → living room [2:03]"
+  * "Casey enters walkway [2:00] → opens gate [2:01] → front door [2:02] → living room [2:03]"
 - Examples of SEPARATE events (not one journey):
-  * "Zoia at garage [2:00]" + "Zoia at garage [2:30]" = 30 min gap, separate events
-  * "Zoia at garage [2:00]" + "Richard at bedroom [2:05]" = different people, separate
+  * "Casey at garage [2:00]" + "Casey at garage [2:30]" = 30 min gap, separate events
+  * "Casey at garage [2:00]" + "Alex at bedroom [2:05]" = different people, separate
 
 Narrative style:
 - Write naturally, like telling a friend what happened at home
@@ -231,8 +279,8 @@ Narrative style:
 - Do NOT invent events that are not in the list
 
 Time segments:
-- timeRange format examples: "Sunday morning", "Monday afternoon", "Sunday night to Monday morning" (for midnight crossings)
-- Periods: morning (6am-12pm), afternoon (12pm-6pm), evening (6pm-12am), night (12am-6am)
+- timeRange format examples: "Sunday morning", "Monday afternoon", "Sunday early morning to Monday morning" (for midnight crossings)
+- Periods: early morning (12am-6am), morning (6am-12pm), afternoon (12pm-6pm), evening (6pm-12am)
 - If ALL events fall in one period, create just ONE segment
 - If events span multiple periods, create multiple segments
 - Minimum 1 segment required, even for a single event

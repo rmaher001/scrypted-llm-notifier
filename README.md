@@ -2,87 +2,102 @@
 
 Enhance security camera notifications with AI-generated descriptions using vision-capable LLMs.
 
+## Requirements
+
+- The **Large Language Model Plugin** (`@scrypted/llm`) with a vision-capable provider.
+- A camera that records, for video playback in the **Brief** and **Activity** tabs. Notifications, descriptions and snapshots work without one.
+
 ## Setup
 
-1. Install the **Scrypted LLM Plugin** from the Scrypted plugin manager
-2. Select an LLM provider (OpenAI, Claude, Gemini, or local) in plugin settings
-3. Enable on your notification devices via the **Extensions** tab on each device
+1. Install the **Large Language Model Plugin** (`@scrypted/llm`) from the Scrypted plugin manager and configure a provider with vision support (OpenAI, Claude, Gemini, or any OpenAI-compatible endpoint).
+2. Install this plugin: in the Scrypted Management Console, go to **Plugins** in the sidebar, search for `llm-notifier`, and install `@rmaher001/scrypted-llm-notifier`. Pick your provider under **LLM Providers**.
+3. On each notification device, open the **Extensions** tab and enable **LLM Notifier**.
+
+Providers are configured in the Large Language Model Plugin's own UI — including local or self-hosted models, via its OpenAI-compatible endpoint option. This plugin only selects from what you have set up there.
+
+Every notification spends one vision-model call. On a cloud provider that is a charge per event — check your provider's image pricing before pointing a busy camera at it.
 
 ## Features
 
 ### AI Notifications
-Vision LLM analyzes notification snapshots and generates contextual titles and descriptions. Preserves known names from face recognition and describes vehicles with make/model/color when visible.
 
-When multiple notifiers are triggered by the same event, only one AI analysis is performed.
+A vision LLM looks at the snapshot and writes the title and description. Known names from face recognition are preserved, and vehicles are described with make, model, and color when visible.
 
-Optionally configure a separate **Notification LLM** for detection enrichment — for example, a fast local model (Ollama, llama.cpp) for real-time notifications while keeping a cloud provider for daily briefs. Multiple providers are load-balanced with round-robin.
+When several notifiers fire on one event, the image is analyzed once.
 
-### Notification Grouping *(optional)*
-Buffer notifications for a configurable window and group related events into a single notification via LLM. Reduces notification spam when multiple cameras trigger on the same activity.
+Set one or more providers under **LLM Providers**. With several, requests are load-balanced round-robin.
 
-Enable by setting **Grouping Window** to a value greater than 0.
+**Notification LLM** is optional: set it to use a different provider for notifications than the rest of the plugin.
 
-### Daily Brief *(optional)*
-A web dashboard that summarizes your day's camera activity into an AI-generated narrative timeline with video clip playback.
+### Daily Brief
 
-- Time-bucketed segments with highlights generated per 6-hour period
-- **Catch Me Up** button for incremental updates since last visit
-- Scheduled push notification with a link to the brief
+A web dashboard at `/brief` summarizing the day's activity as an AI-written narrative timeline with video playback.
 
-Enable daily notifications by turning on **Enable Daily Brief Notifications** in settings.
+- Highlights generated per 6-hour period
+- **Catch Me Up** for everything since your last visit
+- Optional scheduled push notification linking back to the brief
 
-### Gallery
-A searchable history of all past notifications with poster-quality snapshots and video playback. Filter by camera, type, or person — and optionally enable semantic search to find events by visual description. The gallery updates in real time as new detections arrive.
+Turn on **Enable Daily Brief Notifications** and pick a **Notifier for Daily Brief** to get the scheduled push. Without a notifier selected nothing is sent.
 
-Click any event's video to open it in a player with a direct link to the NVR timeline for that camera at the detection timestamp.
+### Activity
+
+A searchable history of past notifications with poster snapshots and video playback. Filter by camera, type, or person. Click any event to play the clip, with a direct link to the NVR timeline at that moment.
+
+Events that Scrypted grouped into a Story are marked with a **Story** badge.
 
 #### Semantic Search *(optional)*
-Add a **Gemini Embedding API Key** in settings to upgrade from keyword search to full semantic search — find events by visual concepts like "red backpack" or "person at front door".
 
-Get a free API key at [Google AI Studio](https://aistudio.google.com/apikey).
+Add a **Gemini Embedding API Key** to search by visual concept — "red backpack", "person at front door" — instead of keywords. Free key at [Google AI Studio](https://aistudio.google.com/apikey).
 
 ### LLM Person Identification *(optional)*
-Builds a reference library of known faces from Scrypted's face recognition data, then uses the LLM to identify unrecognized people in future notifications. Reference photos are automatically cropped to the face region and ranked by quality — higher-scoring photos replace lower-scoring ones over time.
 
-Manage reference photos in the **People** tab of the web UI.
+Builds a reference library of known faces from Scrypted's face recognition, then asks the LLM to identify people Scrypted didn't recognize. Reference photos are cropped to the face and ranked by quality, with better photos replacing worse ones over time.
 
-Enable by turning on **LLM Person Identification** in settings.
+Manage them in the **People** tab. Turn on **LLM Person Identification** to enable.
+
+### LLM Health
+
+Per-call telemetry for every LLM path — success rate, latency percentiles, and quality signals — in the **LLM Health** tab.
+
+Set **Judge Sample Rate** above 0 **and** pick a **Judge LLM Provider** to have a second LLM re-score a sample of notifications for accuracy. Both are required — with no judge provider selected, nothing is scored. Point it at a stronger model than your notification LLM, or the grade is just the same model marking its own work.
 
 ## Settings
 
-| Setting | Description | Default |
-|---------|-------------|---------|
-| LLM Providers | Vision-capable LLMs (load-balanced) | *(required)* |
-| Notification LLM | Separate provider(s) for real-time notifications | *(uses main)* |
-| Snapshot Mode | Cropped, Full, or Both | Cropped |
-| Grouping Window | Buffer seconds before grouping (0 = off) | 0 |
-| LLM Person Identification | Use LLM to identify unknown faces | Off |
-| Enable Daily Brief Notifications | Send scheduled daily summary | Off |
-| Brief Schedule | Hour to send daily notification | 8 PM |
-| Gallery Retention | Days to keep events and posters | 3 |
-| Gemini Embedding API Key | Enables semantic search in Gallery | *(empty)* |
+- **LLM Providers** — vision-capable LLMs, load-balanced. *Required.*
+- **Notification LLM** — *optional.* A different provider for notifications. *Default: uses LLM Providers.*
+- **Enable Notifications** — master switch; off passes notifications through unchanged. *Default: on.*
+- **Snapshot Mode** — cropped, full, or both. *Default: full.*
+- **LLM Timeout (sec)** — per-call timeout. *Default: 90.*
+- **Notification Style** — *optional.* Override the built-in wording instructions. *Default: built-in.*
+- **LLM Person Identification** — *optional.* Identify faces Scrypted didn't recognize. *Default: off.*
+- **Enable Daily Brief Notifications** — *optional.* Send the scheduled summary. *Default: off.*
+- **Notifier for Daily Brief** — *optional.* Which notifier sends it. *Default: none; required for the scheduled summary to be sent.*
+- **Notification Time (Hour)** — *optional.* Hour to send the summary, 0–23. *Default: 20.*
+- **Notification Click URL** — *optional, HA notifiers only.* Opened when the Daily Brief notification is tapped; set it to the HA dashboard path where your Daily Brief card lives. Also the base path for per-event taps below. *Default: `/daily-brief/0`.*
+- **Open Event on Tap (HA only)** — *optional.* Tapping an enhanced notification opens the dashboard above at that event in the Activity tab. *Default: off.*
+- **Activity Retention (Days)** — how long events and posters are kept. *Default: 3.*
+- **Gemini Embedding API Key** — *optional.* Enables semantic search. *Default: empty.*
+- **HA NVR Timeline Path** — *optional.* Dashboard path for the NVR card below. *Default: empty.*
+- **Judge Sample Rate** — *optional.* Fraction of calls re-scored, 0–1. *Default: 0.*
+- **Judge LLM Provider** — *optional.* Provider that re-scores them. *Default: unset — judging is skipped entirely until you pick one.*
 
-## HA Card Setup
+## Home Assistant
 
-Display the Daily Brief as a Home Assistant Lovelace card.
+You'll need your Scrypted token: **Settings → Devices & Services → Scrypted**. Replace `TOKEN` below.
 
-> **You'll need your Scrypted token.** Find it in Home Assistant under **Settings → Devices & Services → Scrypted**. Replace `TOKEN` in both steps below.
+### 1. Add the resource
 
-### Step 1: Add Lovelace Resource
+**Settings → Dashboards → Resources → Add Resource**, type **JavaScript Module**:
 
-1. In Home Assistant, go to **Settings → Dashboards → Resources** (top right)
-2. Click **Add Resource**
-3. URL:
-   ```
-   /api/scrypted/TOKEN/endpoint/@rmaher001/scrypted-llm-notifier/assets/daily-brief-card.js
-   ```
-4. Resource type: **JavaScript Module**
+```
+/api/scrypted/TOKEN/endpoint/@rmaher001/scrypted-llm-notifier/assets/daily-brief-card.js
+```
 
-### Step 2: Create a Panel Dashboard
+This one resource provides both cards below.
 
-Use `type: panel` so the card gets full width. Other view types constrain it to a narrow column.
+### 2. Add the Daily Brief
 
-Open a dashboard's raw YAML editor and paste:
+Use `type: panel` — other view types squeeze the card into a narrow column. In a dashboard's raw YAML editor:
 
 ```yaml
 views:
@@ -94,8 +109,28 @@ views:
         scrypted_token: TOKEN
 ```
 
+### 3. NVR timeline in HA *(optional)*
+
+Without this, NVR links open in a browser. On iPhone that leaves the HA app. This keeps them in-app.
+
+Create a **second** dashboard (for example at path `scrypted`) with:
+
+```yaml
+views:
+  - title: NVR
+    type: panel
+    cards:
+      - type: custom:scrypted-nvr-iframe-card
+        url_template: "https://YOUR_SCRYPTED_HOST/endpoint/YOUR_TOKEN/@scrypted/nvr/public/#/timeline/{camera}?time={time}"
+```
+
+`{camera}` and `{time}` are the only placeholders, filled in per event. Add `default_url` if you want a fallback when an event supplies neither.
+
+Then set **HA NVR Timeline Path** to that dashboard's path (`/scrypted`).
+
 ## Troubleshooting
 
-- **No enhancement**: Check your LLM plugin settings and confirm a model with vision support is selected
-- **Timeouts**: Increase the **LLM Timeout** value in plugin settings, or switch to a faster provider
-- **Stale HA card**: Clear browser cache or check card version in footer
+- **No enhancement** — confirm the provider's model supports vision.
+- **Timeouts** — raise **LLM Timeout (sec)**, or use a faster provider.
+- **Stale HA card** — clear the browser cache, then check the browser console for `Daily Brief Card v… loaded` to confirm which version is running.
+- **Plain notifications on iPhone/Mac** — the Scrypted apps send a text-only preview before the enriched one. Turn off **Immediate Notifications** under **NVR → Preferences → Users → Notification Device**.

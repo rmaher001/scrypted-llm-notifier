@@ -20,6 +20,7 @@ export const ScryptedInterface = {
     VideoCamera: 'VideoCamera',
     ObjectDetector: 'ObjectDetector',
     Settings: 'Settings',
+    EventRecorder: 'EventRecorder',
 };
 
 export const ScryptedDeviceType = {

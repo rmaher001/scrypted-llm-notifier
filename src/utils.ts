@@ -1,5 +1,21 @@
 import jpeg from 'jpeg-js';
 
+/**
+ * Whether a Scrypted camera device can serve a recording seek/clip.
+ *
+ * Decided by METHOD PRESENCE, not `camera.interfaces.includes('VideoRecorder')`:
+ * UniFi Protect cameras expose a working getRecordingStream /
+ * getRecordingStreamThumbnail but do not reliably advertise the VideoRecorder
+ * interface string, so gating on the interface array 400'd clip playback on
+ * cameras that could actually serve it (same class of bug as the v0.3.166
+ * full-frame poster fix in full-frame-source.ts). Callers still wrap the actual
+ * getRecordingStream call in try/catch, so a present-but-unusable method fails
+ * cleanly rather than crashing.
+ */
+export function supportsRecordingStream(camera: any): boolean {
+    return typeof camera?.getRecordingStream === 'function';
+}
+
 export function escapeHtml(str: string): string {
     return str
         .replace(/&/g, '&amp;')
@@ -12,6 +28,27 @@ export function escapeHtml(str: string): string {
 // Helper to validate and normalize clarity from LLM response
 export function parseClarity(raw: any, console?: { warn: (msg: string, ...args: any[]) => void }): {score: number, reason: string} | undefined {
     if (!raw) return undefined;
+
+    // Lenient string recovery: MoE / small models often emit a natural-language
+    // string like "7/10 - reason", "8 (reason)", or "9/10 reason" instead of
+    // the required {score, reason} object. Recover when possible so downstream
+    // face-reference curation and clarity filtering still work.
+    if (typeof raw === 'string') {
+        const scoreMatch = raw.match(/^\s*(\d+)\b/);
+        if (!scoreMatch) {
+            console?.warn('[Clarity] Invalid format from LLM:', raw);
+            return undefined;
+        }
+        const rest = raw.slice(scoreMatch[0].length)
+            .replace(/^\s*\/\s*10\b/, '')        // strip "/10"
+            .replace(/^\s*[-–:(]+\s*/, '')       // strip separator: -, – (en-dash), :, (
+            .replace(/\s*\)\s*$/, '')            // strip trailing ")"
+            .trim();
+        raw = {
+            score: parseInt(scoreMatch[1], 10),
+            reason: rest || 'unspecified',
+        };
+    }
 
     // Validate structure
     if (typeof raw.score !== 'number' || typeof raw.reason !== 'string') {
@@ -187,6 +224,36 @@ export function stripJsonFences(content: string): string {
         return trimmedBody.slice(0, -3).trimEnd();
     }
     return body.trim();
+}
+
+// Extract the first balanced JSON object from arbitrary LLM output.
+// Needed because MLX-VLM (and other servers without constrained decoding)
+// silently ignore response_format and wrap JSON in prose like
+// "Here is the grouping: {...}" or "{...} Hope that helps!".
+export function extractFirstJsonObject(content: string): string {
+    const stripped = stripJsonFences(content);
+    const start = stripped.indexOf('{');
+    if (start === -1) throw new Error('No JSON object found in response');
+
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < stripped.length; i++) {
+        const c = stripped[i];
+        if (escape) { escape = false; continue; }
+        if (inString) {
+            if (c === '\\') { escape = true; continue; }
+            if (c === '"') { inString = false; continue; }
+            continue;
+        }
+        if (c === '"') { inString = true; continue; }
+        if (c === '{') depth++;
+        else if (c === '}') {
+            depth--;
+            if (depth === 0) return stripped.slice(start, i + 1);
+        }
+    }
+    throw new Error('Unbalanced JSON object in response');
 }
 
 export function buildImageList(mode: string, full?: string, cropped?: string): string[] {

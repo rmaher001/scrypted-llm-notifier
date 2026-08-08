@@ -38,9 +38,7 @@ describe('Dead code removal', () => {
         expect(mainTs).not.toMatch(/import\s+\*\s+as\s+fs\s+from\s+['"]fs['"]/);
     });
 
-    test('main.ts should not import path module', () => {
-        expect(mainTs).not.toMatch(/import\s+\*\s+as\s+path\s+from\s+['"]path['"]/);
-    });
+    // `path` is now legitimately imported for LLM telemetry log path resolution.
 });
 
 // ============================================================================

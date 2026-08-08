@@ -11,8 +11,18 @@ import { VIDEO_PLAYER_JS } from '../video-player-embedded';
 // Gallery JS is embedded at build time (for web UI inline embed)
 import { GALLERY_JS } from '../gallery-embedded';
 
+// LLM Health tab JS is embedded at build time (for web UI inline embed)
+import { LLM_HEALTH_JS } from '../llm-health-embedded';
+
+// Scrypted NVR Iframe Card — bundled alongside DailyBriefCard so a single
+// HA <script> include registers both custom elements.
+import { SCRYPTED_NVR_IFRAME_CARD_JS } from '../scrypted-nvr-iframe-card-embedded';
+
 export function getHACardBundle(): string {
-    return HA_CARD_JS;
+    // Concatenate both cards so /brief/ha-card serves them in one fetch.
+    // HA loads the bundle once and each IIFE registers its own
+    // customElements.define independently.
+    return HA_CARD_JS + '\n' + SCRYPTED_NVR_IFRAME_CARD_JS;
 }
 
 // ============================================================================
@@ -28,6 +38,11 @@ export function generateDailyBriefHTML(
     overview?: string,
     narrative?: NarrativeSegment[],
     pluginVersion?: string,
+    cloudBaseUrl?: string,
+    haNvrTimelinePath?: string,
+    selectedDate?: string,
+    minDate?: string,
+    maxDate?: string,
 ): string {
     // Format generation timestamp for display
     const generatedAtStr = generatedAt
@@ -41,6 +56,75 @@ export function generateDailyBriefHTML(
             timeZone: timezone
         })}`
         : 'Generating...';
+
+    // Short generated-time (e.g. "9:00 AM") for the compact meta beside the date
+    // control — replaces the verbose "Generated <weekday> <date> at <time>" subtitle
+    // once the date picker (which already shows the date) is present.
+    const generatedTimeStr = generatedAt
+        ? new Date(generatedAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: timezone })
+        : '';
+
+    // Date selector (header): bounded native date input + prev/next-day arrows.
+    // Only rendered when the route supplies the timezone-aware date bounds.
+    // Navigation reuses the page's `baseUrl` and the existing `?date=YYYY-MM-DD`
+    // route param. Controls use data-attributes (no inline onclick) and the
+    // injected script contains no regex literals or escaped quotes
+    // (feedback_no_inline_onclick_in_templates).
+    const hasDateNav = !!(selectedDate && minDate && maxDate);
+    const prevDisabled = hasDateNav && selectedDate! <= minDate!;
+    const nextDisabled = hasDateNav && selectedDate! >= maxDate!;
+    const dateNavHtml = hasDateNav ? `
+                <div class="date-nav">
+                    <button class="date-arrow" data-date-nav="prev"${prevDisabled ? ' disabled' : ''} aria-label="Previous day">&#8249;</button>
+                    <input type="date" class="date-input" id="briefDate" value="${selectedDate}" min="${minDate}" max="${maxDate}" aria-label="Brief date">
+                    <button class="date-arrow" data-date-nav="next"${nextDisabled ? ' disabled' : ''} aria-label="Next day">&#8250;</button>
+                </div>` : '';
+
+    // Brief-tab control bar: Brief-only controls (date scrubber + generated time on
+    // the left, regenerate + sort on the right). Lives inside #brief-tab — NOT the
+    // global header — because none of these apply to Gallery/People/LLM Health. The
+    // theme toggle stays in the header (it is global). regen/sort keep their existing
+    // global onclick handlers; the date scrubber keeps its data-attr wiring.
+    const briefControlsHtml = `
+        <div class="brief-controls">
+            <div class="brief-controls-left">${dateNavHtml}${generatedTimeStr ? `
+                <span class="gen-meta">${generatedTimeStr}</span>` : ''}
+            </div>
+            <div class="brief-controls-right">
+                <button class="icon-btn" onclick="refreshSummary()" title="Full regeneration (slow)">
+                    <svg viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                </button>
+                <button class="icon-btn sort-btn" onclick="toggleSortOrder()" title="Toggle sort order">
+                    <svg class="sort-newest-icon" viewBox="0 0 24 24"><path d="M3 4h13M3 8h9M3 12h5"/><path d="M19 4v16M19 20l-3-3M19 20l3-3"/></svg>
+                    <svg class="sort-oldest-icon" viewBox="0 0 24 24"><path d="M3 4h5M3 8h9M3 12h13"/><path d="M19 4v16M19 4l-3 3M19 4l3 3"/></svg>
+                </button>
+            </div>
+        </div>`;
+    const dateNavScript = hasDateNav ? `
+        (function() {
+            var briefDateInput = document.getElementById('briefDate');
+            if (!briefDateInput) return;
+            var briefMin = ${JSON.stringify(minDate)};
+            var briefMax = ${JSON.stringify(maxDate)};
+            function stepDate(base, delta) {
+                var p = base.split('-');
+                var dt = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+                dt.setDate(dt.getDate() + delta);
+                var mo = ('0' + (dt.getMonth() + 1)).slice(-2);
+                var da = ('0' + dt.getDate()).slice(-2);
+                return dt.getFullYear() + '-' + mo + '-' + da;
+            }
+            function goBriefDate(d) {
+                if (d < briefMin) d = briefMin;
+                if (d > briefMax) d = briefMax;
+                window.location.href = baseUrl + '/brief?date=' + d;
+            }
+            briefDateInput.addEventListener('change', function() { goBriefDate(briefDateInput.value); });
+            var prevBtn = document.querySelector('[data-date-nav=prev]');
+            var nextBtn = document.querySelector('[data-date-nav=next]');
+            if (prevBtn) prevBtn.addEventListener('click', function() { if (!prevBtn.hasAttribute('disabled')) goBriefDate(stepDate(briefDateInput.value, -1)); });
+            if (nextBtn) nextBtn.addEventListener('click', function() { if (!nextBtn.hasAttribute('disabled')) goBriefDate(stepDate(briefDateInput.value, 1)); });
+        })();` : '';
 
     // Helper to render a cached highlight (compact version for timeline)
     const renderHighlightItem = (h: CachedHighlight, compact: boolean = false, index?: number) => {
@@ -58,7 +142,7 @@ export function generateDailyBriefHTML(
                 : badgeHtml;
         }
         return `
-        <div class="${itemClass}"${indexAttr} data-event-id="${escapeHtml(h.id)}" data-event-title="${escapeHtml(h.title)}" data-event-body="${escapeHtml(h.body)}" data-event-time="${escapeHtml(h.time)}" data-camera-id="${escapeHtml(h.cameraId)}" data-timestamp="${h.timestamp}">
+        <div class="${itemClass}"${indexAttr} data-event-id="${escapeHtml(h.id)}" data-event-title="${escapeHtml(h.title)}" data-event-body="${escapeHtml(h.body)}" data-event-time="${escapeHtml(h.time)}" data-camera-id="${escapeHtml(h.cameraId)}" data-timestamp="${h.seekTimestamp ?? h.timestamp}">
             <div class="event-thumb">
                 ${h.thumbnail === 'poster' ? `<img src="" alt="" data-poster-id="${escapeHtml(h.id)}">` : '<div class="no-thumb"></div>'}
                 ${nameBadge}
@@ -156,10 +240,24 @@ export function generateDailyBriefHTML(
             background: #e8e8e8;
         }
 
-        .header-left { display: flex; align-items: center; gap: 16px; }
-        .header-title { font-size: 14px; font-weight: 500; letter-spacing: 2px; color: var(--text-primary); opacity: 0.7; }
-        .header-date { font-size: 12px; color: var(--text-primary); opacity: 0.5; }
-        .header-actions { display: flex; gap: 8px; align-items: center; }
+        .header-title { font-size: 14px; font-weight: 500; letter-spacing: 2px; color: var(--text-primary); opacity: 0.7; white-space: nowrap; }
+
+        /* Brief-tab control bar — Brief-only controls (date scrubber + generated time, regen + sort) */
+        .brief-controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 12px; padding: 12px 20px; }
+        .brief-controls-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
+        .brief-controls-right { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+        .gen-meta { font-size: 11px; color: var(--text-primary); opacity: 0.4; font-variant-numeric: tabular-nums; letter-spacing: 0.2px; white-space: nowrap; }
+
+        /* Date scrubber — one segmented control (NVR timeline-navigation feel) */
+        .date-nav { display: inline-flex; align-items: stretch; height: 30px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10); border-radius: 8px; overflow: hidden; flex-shrink: 0; }
+        [data-theme="light"] .date-nav { background: rgba(0,0,0,0.04); border-color: rgba(0,0,0,0.10); }
+        .date-arrow { background: transparent; border: none; color: var(--text-primary); width: 30px; display: grid; place-items: center; font-size: 15px; line-height: 1; cursor: pointer; opacity: 0.8; transition: background 0.15s ease, opacity 0.15s ease; }
+        .date-arrow:hover:not(:disabled) { background: rgba(255,255,255,0.08); opacity: 1; }
+        [data-theme="light"] .date-arrow:hover:not(:disabled) { background: rgba(0,0,0,0.06); }
+        .date-arrow:disabled { opacity: 0.25; cursor: default; }
+        .date-input { background: transparent; border: none; border-left: 1px solid rgba(255,255,255,0.10); border-right: 1px solid rgba(255,255,255,0.10); color: var(--text-primary); padding: 0 10px; font-size: 12px; font-variant-numeric: tabular-nums; letter-spacing: 0.3px; cursor: pointer; color-scheme: light dark; field-sizing: content; }
+        [data-theme="light"] .date-input { border-left-color: rgba(0,0,0,0.10); border-right-color: rgba(0,0,0,0.10); }
+        .date-input::-webkit-calendar-picker-indicator { margin-left: 6px; padding: 0; opacity: 0.55; }
 
         .icon-btn {
             background: transparent;
@@ -179,6 +277,9 @@ export function generateDailyBriefHTML(
         .icon-btn:hover { background: rgba(255, 255, 255, 0.1); opacity: 1; }
         [data-theme="light"] .icon-btn:hover { background: rgba(0, 0, 0, 0.1); }
         .icon-btn svg { width: 20px; height: 20px; stroke: currentColor; stroke-width: 2; fill: none; }
+        /* The launcher link reuses .icon-btn (built for <button>); an <a> also
+           needs the underline stripped. */
+        a.launcher-link { text-decoration: none; }
         /* Catch Me Up Button */
         .catchup-bar {
             text-align: center;
@@ -648,6 +749,53 @@ export function generateDailyBriefHTML(
         .modal-content video.loading {
             visibility: hidden;
         }
+        /* Custom controls — replace iOS native overlay (pause button + dim
+           that briefly shows when a <video controls> first plays). */
+        .custom-controls {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+        }
+        .custom-tap-layer {
+            position: absolute; inset: 0; z-index: 2; cursor: pointer;
+            pointer-events: auto;
+        }
+        .custom-pause-indicator {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 72px; height: 72px; border-radius: 50%;
+            background: rgba(0, 0, 0, 0.55); color: #fff;
+            display: none; align-items: center; justify-content: center;
+            z-index: 3; pointer-events: none;
+            transition: opacity 0.15s ease-out; opacity: 0;
+        }
+        .custom-pause-indicator.visible { display: flex; opacity: 1; }
+        .custom-scrub-bar {
+            position: absolute; left: 0; right: 0; bottom: 0;
+            display: flex; align-items: center; gap: 8px;
+            padding: 8px 12px;
+            background: linear-gradient(to top, rgba(0,0,0,0.6), rgba(0,0,0,0));
+            z-index: 3; pointer-events: auto;
+            color: #fff; font-size: 12px; font-variant-numeric: tabular-nums;
+        }
+        .custom-scrub-track {
+            flex: 1; position: relative; height: 24px; cursor: pointer;
+            display: flex; align-items: center;
+        }
+        .custom-scrub-track::before {
+            content: ''; position: absolute; left: 0; right: 0; height: 3px;
+            background: rgba(255, 255, 255, 0.3); border-radius: 2px;
+        }
+        .custom-scrub-fill {
+            position: absolute; left: 0; height: 3px; width: 0;
+            background: var(--accent, #6c63ff); border-radius: 2px;
+        }
+        .custom-scrub-thumb {
+            position: absolute; width: 14px; height: 14px; border-radius: 50%;
+            background: var(--accent, #6c63ff);
+            transform: translateX(-50%);
+            top: 50%; margin-top: -7px; left: 0;
+        }
+        .custom-time { min-width: 36px; text-align: center; }
         .modal-poster {
             position: absolute;
             top: 0;
@@ -693,15 +841,21 @@ export function generateDailyBriefHTML(
             font-size: 16px;
             padding: 40px;
         }
-        .modal-timeline {
-            display: inline-block;
-            color: var(--accent, #6c63ff);
-            font-size: 13px;
-            margin-top: 8px;
-            text-decoration: none;
+        .modal-nvr-btn {
+            display: block;
+            width: 100%;
+            margin-top: 12px;
+            padding: 12px 0;
+            background: var(--accent, #6c63ff);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 680;
+            cursor: pointer;
             text-align: center;
         }
-        .modal-timeline:hover { text-decoration: underline; }
+        .modal-nvr-btn:hover { filter: brightness(1.08); }
         .modal-status {
             color: white;
             font-size: 13px;
@@ -744,34 +898,25 @@ export function generateDailyBriefHTML(
 </head>
 <body>
     <header class="header">
-        <div class="header-left">
-            <div>
-                <div class="header-title">DAILY BRIEF</div>
-                <div class="header-date">${generatedAtStr}${pluginVersion ? ` · v${pluginVersion}` : ''}</div>
-            </div>
-        </div>
-        <div class="header-actions">
-            <button class="icon-btn" onclick="refreshSummary()" title="Full regeneration (slow)">
-                <svg viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-            </button>
-            <button class="icon-btn sort-btn" onclick="toggleSortOrder()" title="Toggle sort order">
-                <svg class="sort-newest-icon" viewBox="0 0 24 24"><path d="M3 4h13M3 8h9M3 12h5"/><path d="M19 4v16M19 20l-3-3M19 20l3-3"/></svg>
-                <svg class="sort-oldest-icon" viewBox="0 0 24 24"><path d="M3 4h5M3 8h9M3 12h13"/><path d="M19 4v16M19 4l-3 3M19 4l3 3"/></svg>
-            </button>
-            <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme">
-                <svg class="moon-icon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-                <svg class="sun-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-            </button>
-        </div>
+        <a class="icon-btn launcher-link" href="/" title="Scrypted apps" aria-label="Scrypted apps">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        </a>
+        <span class="header-title" title="${pluginVersion ? `v${pluginVersion}` : 'Daily Brief'}">DAILY BRIEF</span>
+        <button class="icon-btn" onclick="toggleTheme()" title="Toggle theme">
+            <svg class="moon-icon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+            <svg class="sun-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        </button>
     </header>
 
     <div class="tab-bar">
         <button class="tab active" data-tab="brief">Brief</button>
-        <button class="tab" data-tab="gallery">Gallery</button>
+        <button class="tab" data-tab="activity">Activity</button>
         <button class="tab" data-tab="people">People</button>
+        <button class="tab" data-tab="llm-health">LLM Health</button>
     </div>
 
     <div id="brief-tab" class="tab-content">
+    ${briefControlsHtml}
     <div class="content-wrapper">
     ${hasNarrative ? `
     <!-- New Timeline View -->
@@ -816,7 +961,7 @@ export function generateDailyBriefHTML(
     </div>
     </div><!-- /brief-tab -->
 
-    <div id="gallery-tab" class="tab-content" style="display:none">
+    <div id="activity-tab" class="tab-content" style="display:none">
         <div class="gallery-container"></div>
     </div>
 
@@ -826,22 +971,40 @@ export function generateDailyBriefHTML(
         </div>
     </div>
 
+    <div id="llm-health-tab" class="tab-content" style="display:none">
+        <div class="llm-health-container"></div>
+    </div>
+
     <!-- Video Modal -->
     <div id="videoModal" class="modal" onclick="closeModal(event)">
         <div class="modal-content" onclick="event.stopPropagation()">
             <button class="modal-close" onclick="closeModal()">&times;</button>
             <div class="modal-media-container">
                 <img id="modalPoster" class="modal-poster" style="display:none;">
-                <video id="modalVideo" controls autoplay playsinline></video>
+                <video id="modalVideo" autoplay playsinline></video>
                 <div id="replayOverlay" class="replay-overlay" style="display:none;" onclick="replayVideo()">
                     <button class="replay-btn">\u21BB</button>
+                </div>
+                <div id="customControls" class="custom-controls" style="display:none;">
+                    <div id="customTapLayer" class="custom-tap-layer"></div>
+                    <div id="customPauseIndicator" class="custom-pause-indicator">
+                        <svg viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+                    </div>
+                    <div id="customScrubBar" class="custom-scrub-bar" style="display:none;">
+                        <span id="customCurTime" class="custom-time">0:00</span>
+                        <div id="customScrubTrack" class="custom-scrub-track">
+                            <div id="customScrubFill" class="custom-scrub-fill"></div>
+                            <div id="customScrubThumb" class="custom-scrub-thumb"></div>
+                        </div>
+                        <span id="customDurTime" class="custom-time">0:00</span>
+                    </div>
                 </div>
             </div>
             <div class="modal-info">
                 <span id="modalTitle"></span>
                 <span id="modalBody"></span>
                 <span id="modalTime"></span>
-                <a id="modalTimeline" class="modal-timeline" href="#" target="scrypted-nvr" style="display:none">View in NVR Timeline \u2192</a>
+                <button id="modalNvrBtn" class="modal-nvr-btn" style="display:none">Open in NVR \u2197</button>
                 <div id="modalStatus" class="modal-status"></div>
             </div>
         </div>
@@ -851,6 +1014,7 @@ export function generateDailyBriefHTML(
         try { CSS.registerProperty({ name: '--border-angle', syntax: '<angle>', initialValue: '0deg', inherits: false }); } catch(e) {}
         ${VIDEO_PLAYER_JS}
         ${GALLERY_JS}
+        ${LLM_HEALTH_JS}
     </script>
     <script>
         function getPreferredTheme() {
@@ -869,6 +1033,17 @@ export function generateDailyBriefHTML(
         // Base URL for API calls (derived at runtime from current page URL)
         var baseUrl = window.location.pathname.replace(/\\/brief.*/, '');
 
+        // Absolute Scrypted Cloud base URL (server-injected). Used by the NVR
+        // timeline link so the URL works even when opened in a browser
+        // without HA session cookies (iOS HA Companion -> Safari handoff).
+        ${cloudBaseUrl ? `window.__cloudBaseUrl = ${JSON.stringify(cloudBaseUrl.replace(/\/+$/, ''))};` : '/* cloud base URL not available */'}
+
+        // HA-route NVR timeline path (server-injected from haNvrTimelinePath
+        // setting). Empty string -> openNvrTimeline falls back to the cloud URL.
+        // When set, the "Open in NVR" button (Stories + per-event modal) routes
+        // in-HA to a dashboard hosting scrypted-nvr-iframe-card.
+        var haNvrTimelinePath = ${haNvrTimelinePath ? JSON.stringify(haNvrTimelinePath) : '""'};
+
         function catchMeUp() {
             var btn = event.target.closest('.catchup-btn');
             if (!btn) return;
@@ -879,6 +1054,7 @@ export function generateDailyBriefHTML(
         function refreshSummary() {
             window.location.href = baseUrl + '/brief?refresh=true';
         }
+${dateNavScript}
 
         // Shared URL builder (used by VideoPlayer and Gallery)
         function buildUrl(path, params) {
@@ -901,13 +1077,62 @@ export function generateDailyBriefHTML(
         });
 
         // NVR timeline URL builder — swaps plugin path for NVR path
-        // Works for both direct (/endpoint/...) and HA proxy (/api/scrypted/<token>/endpoint/...)
+        // Prefers the absolute Scrypted Cloud URL when available (set
+        // server-side via window.__cloudBaseUrl). Cloud URL has a
+        // self-contained token so the NVR loads even when the link is
+        // opened in a browser without HA cookies (iOS HA Companion hands
+        // external links to Safari, which lacks the HA session cookie —
+        // that breaks the relative HA-proxy URL on iPhone but not Mac).
+        // Falls back to relative path-rewrite when cloud URL is not
+        // available (works on LAN access via local Scrypted host).
+        // Uses the raw event timestamp (no offset). A previous version
+        // subtracted 5s for pre-roll, but on cameras without continuous
+        // recording the offset put the time param outside the recording
+        // window and NVR returned "recording not available".
         function buildNvrTimelineUrl(cameraId, timestamp) {
             var re = new RegExp('(.*\\/endpoint\\/)[^/]+\\/[^/]+');
-            var nvrBase = baseUrl.replace(re, '$1@scrypted/nvr/public');
-            var clipStart = Number(timestamp) - 5000;
-            return nvrBase + '/#/timeline/' + encodeURIComponent(cameraId) + '?time=' + clipStart;
+            var base = (typeof window.__cloudBaseUrl === 'string' && window.__cloudBaseUrl)
+                ? window.__cloudBaseUrl
+                : baseUrl;
+            var nvrBase = base.replace(re, '$1@scrypted/nvr/public');
+            return nvrBase + '/#/timeline/' + encodeURIComponent(cameraId) + '?time=' + Number(timestamp);
         }
+
+        // Shared "Open in NVR" router — used by BOTH the Activity ▸ Stories detail
+        // button and the per-event video-modal button (Stories-style treatment).
+        // When iframed, route via the parent bridge — kind:'ha' to the NVR iframe
+        // card when haNvrTimelinePath is set (in-HA, cellular-safe), else
+        // kind:'cloud'; plain window.open when standalone (no iframe parent).
+        function openNvrTimeline(cameraId, timeMs) {
+            if (window.parent !== window) {
+                if (haNvrTimelinePath) {
+                    var sep = haNvrTimelinePath.indexOf('?') >= 0 ? '&' : '?';
+                    var haUrl = haNvrTimelinePath + sep + 'camera=' + encodeURIComponent(cameraId) + '&time=' + Number(timeMs);
+                    window.parent.postMessage({ type: 'daily-brief-open-nvr', url: haUrl, kind: 'ha' }, _parentOrigin || '*');
+                } else {
+                    window.parent.postMessage({ type: 'daily-brief-open-nvr', url: buildNvrTimelineUrl(cameraId, timeMs), kind: 'cloud' }, _parentOrigin || '*');
+                }
+            } else {
+                window.open(buildNvrTimelineUrl(cameraId, timeMs), 'scrypted-nvr');
+            }
+        }
+
+        // Wire the modal "Open in NVR" button to the shared openNvrTimeline
+        // router (same path the Stories detail button uses). The router decides
+        // HA-iframe-card vs cloud at click time from haNvrTimelinePath, and posts
+        // through the parent bridge so the 'scrypted-nvr' named target / in-app HA
+        // navigation behaves identically to Stories. A -5000ms pre-roll matches
+        // the in-modal video anchor (notification.timestamp - 5000) so the NVR
+        // scrubber lands at the lead-up, not the analyzer's late detection epoch.
+        (function wireNvrButton() {
+            var btn = document.getElementById('modalNvrBtn');
+            if (!btn) return;
+            btn.addEventListener('click', function() {
+                if (!currentCameraId || !currentTimestamp) return;
+                var preRollMs = 5000;
+                openNvrTimeline(currentCameraId, Number(currentTimestamp) - preRollMs);
+            });
+        })();
 
         // Event delegation for timeline/highlight items (avoids inline onclick XSS)
         document.addEventListener('click', function(e) {
@@ -935,10 +1160,103 @@ export function generateDailyBriefHTML(
             logPrefix: '[WebRTC]'
         });
 
-        // Store current modal metadata for display
+        // Recording-clip duration constant — kept in sync with the server's
+        // getRecordingStream({ duration }) call (src/main.ts). WebRTC's video
+        // element reports duration=Infinity for live streams, so we fall back
+        // to this when displaying progress / total time on the scrub bar.
+        window.__videoExpectedDurationSec = 25;
+
+        // Custom video controls — replace iOS native overlay (pause + dim flash
+        // that briefly shows when <video controls> first plays). Tap toggles
+        // play/pause; scrub bar shown for HTTP playback (finite duration).
+        (function setupCustomControls() {
+            var video = document.getElementById('modalVideo');
+            var controlsEl = document.getElementById('customControls');
+            var tapLayer = document.getElementById('customTapLayer');
+            var pauseInd = document.getElementById('customPauseIndicator');
+            var scrubBar = document.getElementById('customScrubBar');
+            var scrubTrack = document.getElementById('customScrubTrack');
+            var scrubFill = document.getElementById('customScrubFill');
+            var scrubThumb = document.getElementById('customScrubThumb');
+            var curTime = document.getElementById('customCurTime');
+            var durTime = document.getElementById('customDurTime');
+            if (!video || !tapLayer) return;
+
+            function fmt(s) {
+                if (!isFinite(s) || s < 0) return '0:00';
+                var m = Math.floor(s / 60);
+                var sec = Math.floor(s % 60);
+                return m + ':' + (sec < 10 ? '0' : '') + sec;
+            }
+
+            tapLayer.addEventListener('click', function() {
+                if (video.paused) video.play().catch(function() {});
+                else video.pause();
+            });
+
+            // Track expected duration for WebRTC clips (live streams report
+            // Infinity for video.duration even though the underlying clip is
+            // finite). Set externally via window.__videoExpectedDurationSec.
+            function getExpectedDuration() {
+                if (isFinite(video.duration) && video.duration > 0) return video.duration;
+                if (typeof window.__videoExpectedDurationSec === 'number' && window.__videoExpectedDurationSec > 0) {
+                    return window.__videoExpectedDurationSec;
+                }
+                return 0;
+            }
+            function canSeek() {
+                return isFinite(video.duration) && video.duration > 0;
+            }
+
+            video.addEventListener('play', function() {
+                pauseInd.classList.remove('visible');
+            });
+            video.addEventListener('pause', function() {
+                if (video.currentTime > 0 && !video.ended) {
+                    pauseInd.classList.add('visible');
+                }
+            });
+            video.addEventListener('playing', function() {
+                controlsEl.style.display = 'block';
+                scrubBar.style.display = 'flex';
+                var dur = getExpectedDuration();
+                durTime.textContent = dur > 0 ? fmt(dur) : '--';
+                // Disabled-look when seek is not available (live / WebRTC).
+                scrubTrack.style.cursor = canSeek() ? 'pointer' : 'default';
+                scrubThumb.style.opacity = canSeek() ? '1' : '0.5';
+            });
+            video.addEventListener('timeupdate', function() {
+                var dur = getExpectedDuration();
+                if (dur <= 0) return;
+                var pct = Math.min(100, (video.currentTime / dur) * 100);
+                scrubFill.style.width = pct + '%';
+                scrubThumb.style.left = pct + '%';
+                curTime.textContent = fmt(video.currentTime);
+            });
+
+            function seekFromEvent(evt) {
+                if (!canSeek()) return;
+                var rect = scrubTrack.getBoundingClientRect();
+                var clientX = (evt.touches && evt.touches[0]) ? evt.touches[0].clientX : evt.clientX;
+                var pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+                video.currentTime = pct * video.duration;
+            }
+            scrubTrack.addEventListener('click', seekFromEvent);
+            var dragging = false;
+            scrubTrack.addEventListener('mousedown', function(e) { if (!canSeek()) return; dragging = true; seekFromEvent(e); });
+            window.addEventListener('mousemove', function(e) { if (dragging) seekFromEvent(e); });
+            window.addEventListener('mouseup', function() { dragging = false; });
+            scrubTrack.addEventListener('touchstart', function(e) { if (!canSeek()) return; dragging = true; seekFromEvent(e); }, { passive: true });
+            scrubTrack.addEventListener('touchmove', function(e) { if (dragging) seekFromEvent(e); }, { passive: true });
+            scrubTrack.addEventListener('touchend', function() { dragging = false; });
+        })();
+
+        // Store current modal metadata for display + the "Open in NVR" button
         var currentTitle = null;
         var currentBody = null;
         var currentTime = null;
+        var currentCameraId = null;
+        var currentTimestamp = null;
 
         async function openVideoModal(notificationId, title, body, time, cameraId, timestamp) {
             var modal = document.getElementById('videoModal');
@@ -946,14 +1264,14 @@ export function generateDailyBriefHTML(
             document.getElementById('modalBody').textContent = body;
             document.getElementById('modalTime').textContent = time;
 
-            // Set NVR timeline link
-            var timelineLink = document.getElementById('modalTimeline');
-            if (timelineLink && cameraId && timestamp) {
-                timelineLink.href = buildNvrTimelineUrl(cameraId, timestamp);
-                timelineLink.style.display = '';
-            } else if (timelineLink) {
-                timelineLink.style.display = 'none';
-            }
+            // Show the "Open in NVR" button when we know which camera + moment to
+            // open. Routing (HA iframe card vs cloud) and the -5000ms pre-roll are
+            // handled by the button's click handler (wireNvrButton → openNvrTimeline);
+            // stash the camera + timestamp here for it to read.
+            currentCameraId = cameraId || null;
+            currentTimestamp = timestamp || null;
+            var nvrBtn = document.getElementById('modalNvrBtn');
+            if (nvrBtn) nvrBtn.style.display = (cameraId && timestamp) ? '' : 'none';
 
             currentTitle = title;
             currentBody = body;
@@ -987,6 +1305,13 @@ export function generateDailyBriefHTML(
             modal.style.height = '';
             modal.style.bottom = '';
             document.body.style.overflow = '';
+            // Reset custom controls so the next open starts clean
+            var ce = document.getElementById('customControls');
+            var pi = document.getElementById('customPauseIndicator');
+            var sb = document.getElementById('customScrubBar');
+            if (ce) ce.style.display = 'none';
+            if (pi) pi.classList.remove('visible');
+            if (sb) sb.style.display = 'none';
             notifyParentModal('close');
         }
 
@@ -1067,6 +1392,19 @@ export function generateDailyBriefHTML(
             var current = getSortOrder();
             applySortOrder(current === 'newest' ? 'oldest' : 'newest');
         }
+        // Framed (HA card iframe): hide the launcher link. Its href="/" would
+        // resolve to the HA origin and a click replaces this iframe with HA's
+        // own dashboard — and there is no Scrypted launcher there to reach.
+        // This runs FIRST in the init sequence: the calls below touch
+        // localStorage, which can throw and abort the rest of the block, and
+        // the hide must not be lost to that (nor paint before hiding).
+        if (window.parent !== window) {
+            var launcherLink = document.querySelector('.launcher-link');
+            if (launcherLink) {
+                launcherLink.style.display = 'none';
+            }
+        }
+
         setTheme(getPreferredTheme());
         applySortOrder(getSortOrder());
 
@@ -1101,39 +1439,29 @@ export function generateDailyBriefHTML(
                 var target = tab.getAttribute('data-tab');
                 var targetEl = document.getElementById(target + '-tab');
                 if (targetEl) targetEl.style.display = '';
-                // Lazy-init gallery
-                if (target === 'gallery' && !galleryInitialized) {
-                    galleryInitialized = true;
-                    var containerEl = document.querySelector('.gallery-container');
-                    if (typeof Gallery === 'undefined') {
-                        containerEl.innerHTML = '<p style="padding:20px;text-align:center;color:var(--text-primary)">Gallery failed to load. Please refresh the page.</p>';
-                    } else {
-                        try {
-                            gallery = new Gallery({
-                                containerEl: containerEl,
-                                player: player,
-                                buildUrl: buildUrl,
-                                formatTime: function(ts) {
-                                    return new Date(ts).toLocaleString('en-US', {
-                                        month: 'short', day: 'numeric',
-                                        hour: 'numeric', minute: '2-digit', hour12: true
-                                    });
-                                },
-                                onCardClick: function(id, title, body, time, cameraId, timestamp) {
-                                    openVideoModal(id, title, body, time, cameraId, timestamp);
-                                }
-                            });
-                            gallery.init();
-                        } catch (err) {
-                            console.error('[Gallery] Init failed:', err);
-                            containerEl.innerHTML = '<p style="padding:20px;text-align:center;color:var(--text-primary)">Gallery initialization failed.</p>';
-                        }
-                    }
+                // Activity tab → the Events gallery
+                if (target === 'activity') {
+                    initGalleryOnce();
                 }
                 // Lazy-init people
                 if (target === 'people' && !peopleLoaded) {
                     peopleLoaded = true;
                     loadPeople();
+                }
+                // Lazy-init LLM Health
+                if (target === 'llm-health' && !llmHealthInstance) {
+                    var healthContainer = document.querySelector('.llm-health-container');
+                    if (typeof LlmHealth === 'undefined') {
+                        healthContainer.innerHTML = '<p style="padding:20px;text-align:center;color:var(--text-primary)">LLM Health failed to load.</p>';
+                    } else {
+                        try {
+                            llmHealthInstance = new LlmHealth({ containerEl: healthContainer, buildUrl: buildUrl });
+                            llmHealthInstance.init();
+                        } catch (err) {
+                            console.error('[LLM Health] Init failed:', err);
+                            healthContainer.innerHTML = '<p style="padding:20px;text-align:center;color:var(--text-primary)">LLM Health init failed.</p>';
+                        }
+                    }
                 }
                 // Update URL without reload
                 var url = new URL(window.location);
@@ -1141,6 +1469,36 @@ export function generateDailyBriefHTML(
                 window.history.replaceState({}, '', url);
             };
         });
+
+        function initGalleryOnce() {
+            if (galleryInitialized) return;
+            galleryInitialized = true;
+            var containerEl = document.querySelector('.gallery-container');
+            if (typeof Gallery === 'undefined') {
+                containerEl.innerHTML = '<p style="padding:20px;text-align:center;color:var(--text-primary)">Gallery failed to load. Please refresh the page.</p>';
+                return;
+            }
+            try {
+                gallery = new Gallery({
+                    containerEl: containerEl,
+                    player: player,
+                    buildUrl: buildUrl,
+                    formatTime: function(ts) {
+                        return new Date(ts).toLocaleString('en-US', {
+                            month: 'short', day: 'numeric',
+                            hour: 'numeric', minute: '2-digit', hour12: true
+                        });
+                    },
+                    onCardClick: function(id, title, body, time, cameraId, timestamp) {
+                        openVideoModal(id, title, body, time, cameraId, timestamp);
+                    }
+                });
+                gallery.init();
+            } catch (err) {
+                console.error('[Gallery] Init failed:', err);
+                containerEl.innerHTML = '<p style="padding:20px;text-align:center;color:var(--text-primary)">Gallery initialization failed.</p>';
+            }
+        }
 
         document.addEventListener('click', function(e) {
             var btn = e.target.closest('.person-delete');
@@ -1156,6 +1514,7 @@ export function generateDailyBriefHTML(
         });
 
         var peopleLoaded = false;
+        var llmHealthInstance = null;
         function loadPeople() {
             var grid = document.querySelector('.people-grid');
             grid.innerHTML = '<div class="people-empty">Loading...</div>';
@@ -1188,12 +1547,66 @@ export function generateDailyBriefHTML(
         (function() {
             var params = new URLSearchParams(window.location.search);
             var tab = params.get('tab');
-            if (tab === 'gallery') {
-                var galleryTab = document.querySelector('.tab[data-tab="gallery"]');
+            var deepLinkId = params.get('id');
+            var deepLinkGroupId = params.get('groupId');
+
+            // Deep link to a group: switch to Gallery tab and drill into the
+            // group's hero view once the gallery initializes. Bail out if the
+            // user navigates to a different tab during the poll window.
+            if (deepLinkGroupId) {
+                var gTab = document.querySelector('.tab[data-tab="activity"]');
+                if (gTab) gTab.click();
+                var groupAttempts = 0;
+                var groupPoll = setInterval(function() {
+                    groupAttempts++;
+                    if (groupAttempts > 50) { clearInterval(groupPoll); return; }
+                    var galleryTabActive = document.querySelector('.tab[data-tab="activity"].active');
+                    if (!galleryTabActive) { clearInterval(groupPoll); return; }
+                    // Wait for the gallery's initial page fetch to settle before
+                    // drilling — _drillIntoGroup early-returns if _loading is true,
+                    // so calling it on the first tick (while _fetchPage is in flight)
+                    // silently no-ops and the user sees the normal gallery list.
+                    if (gallery && typeof gallery._drillIntoGroup === 'function' && !gallery._loading) {
+                        clearInterval(groupPoll);
+                        gallery._drillIntoGroup(deepLinkGroupId);
+                    }
+                }, 100);
+                return;
+            }
+
+            // Deep link to a specific gallery entry: switch to Gallery tab and
+            // open that card's modal once the card renders. Bounded polling so
+            // we fail gracefully if the notification has scrolled off page 1.
+            if (deepLinkId) {
+                var gTab = document.querySelector('.tab[data-tab="activity"]');
+                if (gTab) gTab.click();
+                var attempts = 0;
+                var poll = setInterval(function() {
+                    attempts++;
+                    if (attempts > 50) { clearInterval(poll); return; }
+                    var cards = document.querySelectorAll('.gallery-card');
+                    for (var i = 0; i < cards.length; i++) {
+                        if (cards[i].getAttribute('data-id') === deepLinkId) {
+                            var match = cards[i];
+                            clearInterval(poll);
+                            match.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            setTimeout(function() { match.click(); }, 200);
+                            return;
+                        }
+                    }
+                }, 100);
+                return;
+            }
+
+            if (tab === 'gallery' || tab === 'activity') {
+                var galleryTab = document.querySelector('.tab[data-tab="activity"]');
                 if (galleryTab) galleryTab.click();
             } else if (tab === 'people') {
                 var peopleTab = document.querySelector('.tab[data-tab="people"]');
                 if (peopleTab) peopleTab.click();
+            } else if (tab === 'llm-health') {
+                var healthTab = document.querySelector('.tab[data-tab="llm-health"]');
+                if (healthTab) healthTab.click();
             }
         })();
     </script>

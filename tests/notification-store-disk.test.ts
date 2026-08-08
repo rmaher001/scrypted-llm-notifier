@@ -134,25 +134,6 @@ describe('NotificationStore disk wiring', () => {
         });
     });
 
-    describe('updateGroup() after disk init', () => {
-        it('appends updated entries to log', async () => {
-            const storage = makeStorage();
-            const store = new NotificationStore(storage, getFilesPath);
-            await store.initDiskStorage();
-
-            store.add(makeNotification('n1'));
-            store.add(makeNotification('n2'));
-            store.updateGroup(['n1', 'n2'], 'group-abc', 'n1');
-
-            const lines = await readJsonl('notifications.jsonl');
-            // 2 initial appends + 2 updated appends = 4 lines
-            expect(lines).toHaveLength(4);
-            const lastN1 = lines.filter((l: any) => l.id === 'n1').pop();
-            expect(lastN1.groupId).toBe('group-abc');
-            expect(lastN1.isGroupPrimary).toBe(true);
-        });
-    });
-
     describe('markHasPoster() after disk init', () => {
         it('appends updated entry to log', async () => {
             const storage = makeStorage();

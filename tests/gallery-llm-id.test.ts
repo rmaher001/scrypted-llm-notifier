@@ -26,9 +26,9 @@ function makeNotif(id: string, overrides?: Partial<StoredNotification>): StoredN
 
 describe('GalleryNotification llmIdentifiedName field', () => {
     it('returns llmIdentifiedName when present on StoredNotification', () => {
-        const notifications = [makeNotif('n1', { llmIdentifiedName: 'Richard' })];
+        const notifications = [makeNotif('n1', { llmIdentifiedName: 'Alex' })];
         const result = getGalleryPage(notifications, 1, 50, {});
-        expect(result.notifications[0].llmIdentifiedName).toBe('Richard');
+        expect(result.notifications[0].llmIdentifiedName).toBe('Alex');
     });
 
     it('returns undefined llmIdentifiedName when not set', () => {
@@ -52,12 +52,12 @@ describe('name filter includes llmIdentifiedName', () => {
 
     it('does not duplicate when llmIdentifiedName already in names[]', () => {
         const notifications = [
-            makeNotif('n1', { names: ['Richard'], llmIdentifiedName: 'Richard' }),
+            makeNotif('n1', { names: ['Alex'], llmIdentifiedName: 'Alex' }),
         ];
         const result = getGalleryPage(notifications, 1, 50, {});
         // Set deduplication: should appear only once
-        const richardCount = result.filters.names.filter(n => n === 'Richard').length;
-        expect(richardCount).toBe(1);
+        const alexCount = result.filters.names.filter(n => n === 'Alex').length;
+        expect(alexCount).toBe(1);
     });
 
     it('name filter matches notifications where only llmIdentifiedName matches', () => {
@@ -87,20 +87,20 @@ describe('name filter includes llmIdentifiedName', () => {
 describe('keywordSearch matches llmIdentifiedName', () => {
     it('finds notification by llmIdentifiedName', () => {
         const notifications = [
-            makeNotif('n1', { llmIdentifiedName: 'Richard' }),
-            makeNotif('n2', { llmIdentifiedName: 'Olesia' }),
+            makeNotif('n1', { llmIdentifiedName: 'Alex' }),
+            makeNotif('n2', { llmIdentifiedName: 'Blake' }),
             makeNotif('n3'),
         ];
-        const results = keywordSearch('richard', notifications);
+        const results = keywordSearch('alex', notifications);
         expect(results).toHaveLength(1);
         expect(results[0].id).toBe('n1');
     });
 
     it('is case insensitive for llmIdentifiedName', () => {
         const notifications = [
-            makeNotif('n1', { llmIdentifiedName: 'Richard' }),
+            makeNotif('n1', { llmIdentifiedName: 'Alex' }),
         ];
-        const results = keywordSearch('RICHARD', notifications);
+        const results = keywordSearch('ALEX', notifications);
         expect(results).toHaveLength(1);
     });
 });

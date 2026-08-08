@@ -221,6 +221,15 @@ class Gallery {
       '</div>' +
       '</div>' +
       '<div class="gallery-status"></div>' +
+      '<div class="group-hero-shell" style="display:none">' +
+        '<div class="group-hero">' +
+          '<img class="group-hero-img" alt="" />' +
+          '<div class="group-hero-meta-start"></div>' +
+          '<div class="group-hero-meta-duration"></div>' +
+        '</div>' +
+        '<div class="group-hero-summary"></div>' +
+        '<div class="group-hero-strip-label">All events in this group</div>' +
+      '</div>' +
       '<div class="gallery-grid"></div>' +
       '<div class="gallery-load-more-wrap">' +
         '<button class="gallery-load-more" style="display:none">Load More</button>' +
@@ -238,6 +247,20 @@ class Gallery {
     }
 
     this._gridEl = shell.querySelector('.gallery-grid');
+    this._heroShellEl = shell.querySelector('.group-hero-shell');
+    this._heroImgEl = shell.querySelector('.group-hero-img');
+    this._heroMetaStartEl = shell.querySelector('.group-hero-meta-start');
+    this._heroMetaDurationEl = shell.querySelector('.group-hero-meta-duration');
+    this._heroSummaryEl = shell.querySelector('.group-hero-summary');
+    // Tap-to-play on the hero composite — delegates to the primary card's
+    // existing click handler (modal-open path stays in one place).
+    if (this._heroImgEl) {
+      this._heroImgEl.addEventListener('click', function() {
+        if (!self._heroPrimaryId || !self._gridEl) return;
+        var primaryCard = self._gridEl.querySelector('.gallery-card[data-id="' + self._heroPrimaryId + '"]');
+        if (primaryCard) primaryCard.click();
+      });
+    }
     this._searchInput = shell.querySelector('.gallery-search-input');
     this._cameraSelect = shell.querySelector('.gallery-camera-filter');
     this._typeSelect = shell.querySelector('.gallery-type-filter');
@@ -275,7 +298,19 @@ class Gallery {
       var n = notifications[i];
       var time = self._formatTime(n.timestamp);
       var title = n.llmTitle || 'Detection';
-      var thumbSrc = n.thumbnailUrl ? self._buildUrl('/brief/snapshot', { id: n.id }) : '';
+      // v0.3.124: use the server-provided thumbnailUrl's id parameter so
+      // grouped primaries get the composite snapshot ('group-<groupId>'),
+      // not the per-event poster. Pre-v0.3.124 we hardcoded `id: n.id` here,
+      // which silently undid the server-side decision made in
+      // buildThumbnailUrl (src/gallery.ts).
+      var thumbSrc = '';
+      if (n.thumbnailUrl) {
+        var snapId = n.id;
+        if (n.groupId && n.groupSize && n.groupSize > 1) {
+          snapId = 'group-' + n.groupId;
+        }
+        thumbSrc = self._buildUrl('/brief/snapshot', { id: snapId });
+      }
       var escapedId = self._escapeHtml(n.id);
       var escapedTitle = self._escapeHtml(title);
       var escapedBody = self._escapeHtml(n.llmBody || '');
@@ -283,7 +318,19 @@ class Gallery {
       var groupBadge = (n.groupSize && n.groupSize > 1)
         ? '<span class="gallery-group-badge">' + n.groupSize + ' events</span>'
         : '';
-      // Name badges: Scrypted (green), LLM (teal), Both (purple) — stacked for multi-person
+      // v0.3.170: Scrypted's native Summary/Story digests cover a SPAN of
+      // activity rather than one detection, so their poster/clip/NVR-link
+      // behaviour differs from per-detection cards. Label them so the two are
+      // tellable apart on screen. Bottom-left: the group badge owns top-right
+      // and the name badges own top-left. Carries the word "Story" because
+      // colour alone is not a usable signal here (see v0.3.132).
+      var storyBadge = n.isSummary
+        ? '<span class="gallery-story-badge">\uD83D\uDCD6 Story</span>'
+        : '';
+      // Name badges (colorblind-safe v0.3.132): Scrypted (yellow), LLM (blue),
+      // Both (dark gray, hue-free). Yellow/blue is the canonical colorblind-
+      // safe pair; gray for "both" is unambiguous against either. Icons
+      // (👤 / ✨) provide shape redundancy. Stacked for multi-person.
       var nameBadge = '';
       var badgeItems = self._buildNameBadges(n.names, n.llmIdentifiedNames, n.llmIdentifiedName);
       if (badgeItems.length > 0) {
@@ -294,12 +341,17 @@ class Gallery {
           ? '<div class="gallery-name-badges">' + badgeHtml + '</div>'
           : badgeHtml;
       }
+      // data-timestamp is a SEEK anchor, not a display value (the card shows
+      // data-time). v0.3.173: emit the poster's seek instant so "Open in NVR"
+      // lands where the image came from; on a Story our handling time is
+      // 44-300s later. Falls back for records written before v0.3.173.
       var groupAttr = n.groupId ? ' data-group-id="' + self._escapeHtml(n.groupId) + '"' : '';
       var groupSizeAttr = (n.groupSize && n.groupSize > 1) ? ' data-group-size="' + n.groupSize + '"' : '';
       html +=
-        '<div class="gallery-card" data-id="' + escapedId + '" data-title="' + escapedTitle + '" data-body="' + escapedBody + '" data-time="' + escapedTime + '" data-camera-id="' + self._escapeHtml(n.cameraId || '') + '" data-timestamp="' + (n.timestamp || '') + '"' + groupAttr + groupSizeAttr + '>' +
+        '<div class="gallery-card" data-id="' + escapedId + '" data-title="' + escapedTitle + '" data-body="' + escapedBody + '" data-time="' + escapedTime + '" data-camera-id="' + self._escapeHtml(n.cameraId || '') + '" data-timestamp="' + (n.seekTimestamp || n.timestamp || '') + '"' + groupAttr + groupSizeAttr + '>' +
           '<div class="gallery-card-thumb">' +
             (thumbSrc ? '<img src="' + thumbSrc + '" alt="" loading="lazy" />' : '<div class="gallery-card-no-thumb"></div>') +
+            storyBadge +
             groupBadge + nameBadge +
           '</div>' +
           '<div class="gallery-card-info">' +
@@ -439,6 +491,7 @@ class Gallery {
       this._total = data.total;
       this._hasMore = false;
       this._searchMode = null;
+      this._renderGroupHero(data);
       this._renderCards(this._notifications);
       this._renderSearchMode(null);
       // Show back button
@@ -473,6 +526,7 @@ class Gallery {
     this._savedState = null;
 
     // Re-render with saved state
+    this._hideGroupHero();
     this._renderCards(this._notifications);
     this._renderFilters(this._filters);
     this._renderSearchMode(this._searchMode);
@@ -512,6 +566,53 @@ class Gallery {
   _setControlsVisible(visible) {
     var stickyWrap = this._containerEl.querySelector('.gallery-controls-sticky');
     if (stickyWrap) stickyWrap.style.display = visible ? '' : 'none';
+  }
+
+  // Renders the group hero block: composite image with start-time + duration
+  // overlays and the LLM group summary text. Strip thumbnails (clickable) are
+  // rendered by the existing _renderCards path into the grid below.
+  _renderGroupHero(data) {
+    if (!this._heroShellEl) return;
+    if (!data || !data.groupId) {
+      this._hideGroupHero();
+      return;
+    }
+    // Always build the hero URL client-side using the runtime-derived baseUrl.
+    // The server's data.groupHeroUrl is constructed with the Scrypted-internal
+    // rootPath, which doesn't resolve when the page is loaded through the HA
+    // proxy (the browser would fetch a path that doesn't traverse the proxy).
+    // Mirrors the thumbnail pattern: server signals presence, client builds
+    // the actual URL.
+    var heroUrl = this._buildUrl('/brief/snapshot', { id: 'group-' + data.groupId });
+    this._heroImgEl.src = heroUrl;
+    // Tap the composite to play the primary event's video. We delegate to the
+    // primary card's existing click handler so the modal-open path stays in
+    // one place.
+    this._heroPrimaryId = data.groupPrimaryId || null;
+    var startMs = (typeof data.groupStartMs === 'number') ? data.groupStartMs : null;
+    var durMs = (typeof data.groupDurationMs === 'number') ? data.groupDurationMs : null;
+    this._heroMetaStartEl.textContent = (startMs != null) ? this._formatTime(startMs) : '';
+    this._heroMetaDurationEl.textContent = (durMs != null && durMs > 0) ? this._formatDuration(durMs) : '';
+    this._heroSummaryEl.textContent = data.groupBody || '';
+    this._heroShellEl.style.display = '';
+  }
+
+  _hideGroupHero() {
+    if (this._heroShellEl) this._heroShellEl.style.display = 'none';
+    if (this._heroImgEl) this._heroImgEl.removeAttribute('src');
+  }
+
+  // Mirror of TS formatDuration: "Xs" / "XmYs" / "XhYm" / "<1s".
+  _formatDuration(ms) {
+    if (!isFinite(ms) || ms <= 0) return '';
+    if (ms < 1000) return '<1s';
+    var totalSec = Math.floor(ms / 1000);
+    var h = Math.floor(totalSec / 3600);
+    var m = Math.floor((totalSec % 3600) / 60);
+    var s = totalSec % 60;
+    if (h > 0) return m > 0 ? (h + 'h' + m + 'm') : (h + 'h');
+    if (m > 0) return s > 0 ? (m + 'm' + s + 's') : (m + 'm');
+    return s + 's';
   }
 
   _buildNameBadges(names, llmIdentifiedNames, llmIdentifiedName) {
@@ -577,26 +678,51 @@ Gallery.CSS = '' +
     'background: var(--bg-secondary, #1a1a2e); transition: transform 0.15s, box-shadow 0.15s;' +
   '}' +
   '.gallery-card:hover { transform: scale(1.03); box-shadow: 0 4px 16px rgba(0,0,0,0.3); }' +
-  '.gallery-card-thumb { width: 100%; aspect-ratio: 16/9; overflow: hidden; background: #111; position: relative; }' +
+  // v0.3.126: unified aspect-ratio across all cards (1280/965) so a
+  // grouped composite (which IS 1280/965) fits without clipping AND
+  // sits in the same row height as adjacent solo cards — no staircase
+  // in the 2-column grid. Solo cards (16:9 source) are cover-fit into
+  // the taller container, losing ~17% on each horizontal side; the
+  // subject is already centered by subject-crop so the loss is minimal.
+  '.gallery-card-thumb { width: 100%; aspect-ratio: 1280/965; overflow: hidden; background: #111; position: relative; }' +
   '.gallery-card-thumb img { width: 100%; height: 100%; object-fit: cover; }' +
   '.gallery-card-no-thumb { width: 100%; height: 100%; background: #222; }' +
+  // v0.3.170 Story badge: bottom-left so it clears the group badge (top-right)
+  // and the name badges (top-left). Hue-free dark chip + the literal word
+  // "Story" + a book glyph — readable independent of colour vision.
+  '.gallery-story-badge {' +
+    'position: absolute; bottom: 6px; left: 6px; padding: 2px 8px; border-radius: 10px;' +
+    'background: rgba(28, 28, 30, 0.92); color: #fff; font-size: 11px; font-weight: 600;' +
+    'border: 1px solid rgba(255,255,255,0.35);' +
+    'pointer-events: none; line-height: 1.4;' +
+  '}' +
   '.gallery-group-badge {' +
     'position: absolute; top: 6px; right: 6px; padding: 2px 8px; border-radius: 10px;' +
     'background: rgba(108, 99, 255, 0.9); color: #fff; font-size: 11px; font-weight: 600;' +
     'pointer-events: none; line-height: 1.4;' +
   '}' +
+  // v0.3.127: person/name badges moved to top-left so they don't overlap
+  // the composite strip-tile row at the bottom of grouped cards. Group-count
+  // badge stays top-right (no collision).
   '.gallery-name-badges {' +
-    'position: absolute; bottom: 6px; left: 6px; display: flex; flex-direction: column; gap: 2px; pointer-events: none;' +
+    'position: absolute; top: 6px; left: 6px; display: flex; flex-direction: column; gap: 2px; pointer-events: none;' +
   '}' +
   '.gallery-name-badges .gallery-name-badge { position: static; }' +
   '.gallery-name-badge {' +
-    'position: absolute; bottom: 6px; left: 6px; padding: 2px 8px; border-radius: 10px;' +
-    'color: #fff; font-size: 11px; font-weight: 600;' +
+    'position: absolute; top: 6px; left: 6px; padding: 2px 8px; border-radius: 10px;' +
+    'font-size: 11px; font-weight: 600;' +
     'pointer-events: none; line-height: 1.4;' +
   '}' +
-  '.gallery-name-scrypted { background: rgba(76, 175, 80, 0.85); }' +
-  '.gallery-name-llm { background: rgba(0, 188, 212, 0.85); }' +
-  '.gallery-name-both { background: rgba(123, 44, 191, 0.85); }' +
+  // v0.3.132: colorblind-safe palette. Yellow/blue is the canonical pair
+  // that holds distinguishability across deuteranopia, protanopia, AND
+  // tritanopia. v0.3.131 tried magenta for "both" — operator confirmed
+  // they can't distinguish magenta from blue under their colorblindness.
+  // Switched "both" to DARK GRAY: hue-free, maximally distinct from any
+  // colored badge, always readable. Icons (👤 / ✨ / 👤✨) still provide
+  // shape redundancy independent of color.
+  '.gallery-name-scrypted { background: rgba(255, 176, 0, 0.95); color: #000; }' +  // yellow — Scrypted only (11.5:1 vs black)
+  '.gallery-name-llm { background: rgba(100, 143, 255, 0.95); color: #000; }' +     // blue — LLM only (6.9:1 vs black)
+  '.gallery-name-both { background: rgba(50, 50, 50, 0.95); color: #fff; }' +       // dark gray — both matched (12:1 vs white)
   '.gallery-card-info { padding: 8px; }' +
   '.gallery-card-time { font-size: 11px; color: var(--text-secondary, #888); }' +
   '.gallery-card-title { font-size: 13px; color: var(--text-primary, #e0e0e0); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }' +
@@ -615,4 +741,32 @@ Gallery.CSS = '' +
     'border: 1px solid var(--bg-secondary, #333); background: var(--bg-secondary, #1a1a2e);' +
     'color: var(--text-primary, #e0e0e0); font-size: 13px; cursor: pointer;' +
   '}' +
-  '.gallery-back-btn:hover { background: var(--accent, #6c63ff); color: #fff; }';
+  '.gallery-back-btn:hover { background: var(--accent, #6c63ff); color: #fff; }' +
+  // ---- Group hero view ----
+  // The composite JPEG is 1280x965 (16:9 hero on top of a 245px strip);
+  // aspect-ratio matches so the whole composite shows without cropping.
+  // Meta overlays are positioned at the bottom of the HERO portion (not the
+  // bottom of the container, which would land on the strip thumbnails).
+  '.group-hero-shell { margin-bottom: 16px; }' +
+  '.group-hero {' +
+    'position: relative; width: 100%; aspect-ratio: 1280/965; overflow: hidden;' +
+    'border-radius: 12px; background: #111; margin-bottom: 12px; cursor: pointer;' +
+  '}' +
+  '.group-hero-img { width: 100%; height: 100%; object-fit: cover; display: block; }' +
+  '.group-hero-meta-start, .group-hero-meta-duration {' +
+    // 245/965 ≈ 25.4% — the strip occupies the bottom 25.4% of the composite.
+    // Place overlays just above the strip so they sit at the bottom of the hero.
+    'position: absolute; bottom: calc(25.4% + 12px); padding: 4px 10px; border-radius: 6px;' +
+    'background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 13px; font-weight: 500;' +
+    'pointer-events: none; line-height: 1.4;' +
+  '}' +
+  '.group-hero-meta-start { left: 12px; }' +
+  '.group-hero-meta-duration { right: 12px; }' +
+  '.group-hero-summary {' +
+    'color: var(--text-primary, #e0e0e0); font-size: 14px; line-height: 1.5;' +
+    'padding: 0 4px 12px;' +
+  '}' +
+  '.group-hero-strip-label {' +
+    'color: var(--text-secondary, #888); font-size: 12px; text-transform: uppercase;' +
+    'letter-spacing: 0.5px; margin-bottom: 8px; padding: 0 4px;' +
+  '}';

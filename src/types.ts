@@ -24,8 +24,17 @@ export interface StoredNotification {
     embeddingDimension?: number;  // vector length for compatibility checks
     groupId?: string;             // Links notifications in the same group (undefined = ungrouped)
     isGroupPrimary?: boolean;     // True = representative notification for its group (highest clarity)
+    llmGroupTitle?: string;       // Consolidated LLM group title (set on primary record only)
+    llmGroupSubtitle?: string;    // Consolidated LLM group subtitle (set on primary record only)
+    llmGroupBody?: string;        // Consolidated LLM group body (set on primary record only)
     llmIdentifiedName?: string;   // DEPRECATED: singular LLM-identified name (backward compat for pre-deploy notifications)
     llmIdentifiedNames?: string[]; // Names identified by LLM from reference photos (multi-person)
+    seekTimestamp?: number;       // Instant the NVR recording should be seeked to (recordedEvent.data.timestamp).
+                                  // Distinct from `timestamp`, which is when WE handled the notification and stays
+                                  // the card's displayed/sort time. They differ by ~1.5s for a per-detection event
+                                  // but 44-300s for a Story, which is emitted when the story completes.
+                                  // Undefined on records written before v0.3.173.
+    isSummary?: boolean;          // True = Scrypted native Summary/Story digest (spans activity) rather than a single detection. Undefined on records written before v0.3.170.
 }
 
 export interface DailyStats {
@@ -41,6 +50,7 @@ export interface CachedHighlight {
     cameraId: string;
     cameraName: string;
     timestamp: number;
+    seekTimestamp?: number; // NVR seek anchor (poster's instant); see StoredNotification.seekTimestamp.
     date: string;           // formatted date string (e.g., "December 19")
     time: string;           // formatted time string
     title: string;          // llmTitle
@@ -97,6 +107,7 @@ export interface FrozenSegment {
     periodStart: number;
     periodEnd: number;
     narrative: NarrativeSegment;    // the frozen text + original highlightIds
+    overview?: string;              // LLM's per-period overview (1-2 sentences). See issue #10.
     highlights: CachedHighlight[];  // resolved highlight objects
     highlightNotificationIds: string[];  // notification IDs for re-indexing across runs
 }
@@ -112,3 +123,4 @@ export interface CandidateWithPriority {
     notification: StoredNotification;
     isPriority: boolean;  // true for named/animal/vehicle, false for random fill
 }
+

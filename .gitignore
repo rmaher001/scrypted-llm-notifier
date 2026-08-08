@@ -19,5 +19,8 @@ out/
 # Scrypted
 .scrypted/
 
-# Claude
-.claude/external/
+# Claude — agent tooling state (settings, worktrees, working plans), not project code
+.claude/
+
+# Brainstorming visual-companion artifacts (dev-only)
+.superpowers/

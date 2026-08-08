@@ -59,6 +59,76 @@ export function keywordSearch(query: string, notifications: StoredNotification[]
 
 // ---- Group collapsing ----
 
+/**
+ * Build the gallery card thumbnail URL for a notification.
+ *
+ * Per 2026-05-15 spec §4.5/§4.8 (v0.3.123): grouped events show the composite
+ * in their gallery card, matching the image shown in the notification. Solo
+ * events fall back to their per-event poster. Drill-down view always uses
+ * the per-event poster (the group hero shell renders the composite
+ * separately above the strip).
+ *
+ * Singleton "groups" (size=1) and orphans (size=undefined) fall back to the
+ * per-event poster because no composite was written for those cases.
+ *
+ * Call-site assumption: in the flat-list path, callers pass only group
+ * primaries (collapseByGroup filters non-primaries upstream). The helper
+ * does NOT re-check isGroupPrimary — a non-primary passed in with
+ * groupSize > 1 would still get the composite URL, which is undefined behavior.
+ */
+export function buildThumbnailUrl(
+    n: StoredNotification,
+    base: string,
+    _opts: { isDrillDown: boolean; groupSize?: number },
+): string {
+    // Always return the per-event poster URL. Group composite posters were
+    // produced by the deleted v0.3.83-v0.3.116 grouping pipeline; the
+    // composite endpoint is gone and any group-* poster URL now 404s. Old
+    // JSONL records may still carry `groupId`, but Phase 8 migration strips
+    // them. Until that runs, this function ignores groupId to avoid broken
+    // image URLs against existing data.
+    return n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '';
+}
+
+/**
+ * Build a per-group union of identified names so the gallery card's
+ * name badges reflect everyone identified across the WHOLE group, not
+ * just the primary record. Pre-v0.3.129 bug: a primary that didn't
+ * catch a face left the card with no badge even when other group
+ * members had clearly identified the same person in the composite.
+ */
+export interface GroupNamesEntry {
+    /** Scrypted face-recognition names (StoredNotification.names) union. */
+    names: string[];
+    /** LLM-identified names (llmIdentifiedNames + legacy llmIdentifiedName) union. */
+    llmIdentifiedNames: string[];
+}
+
+export function buildGroupNamesIndex(
+    notifications: StoredNotification[],
+): Map<string, GroupNamesEntry> {
+    const idx = new Map<string, { names: Set<string>; llm: Set<string> }>();
+    for (const n of notifications) {
+        if (!n.groupId) continue;
+        let entry = idx.get(n.groupId);
+        if (!entry) {
+            entry = { names: new Set<string>(), llm: new Set<string>() };
+            idx.set(n.groupId, entry);
+        }
+        for (const name of n.names || []) entry.names.add(name);
+        for (const name of n.llmIdentifiedNames || []) entry.llm.add(name);
+        if (n.llmIdentifiedName) entry.llm.add(n.llmIdentifiedName);
+    }
+    const out = new Map<string, GroupNamesEntry>();
+    for (const [gid, e] of idx) {
+        out.set(gid, {
+            names: Array.from(e.names),
+            llmIdentifiedNames: Array.from(e.llm),
+        });
+    }
+    return out;
+}
+
 export function collapseByGroup(notifications: StoredNotification[]): StoredNotification[] {
     return notifications.filter(n => {
         if (!n.groupId) return true;            // ungrouped — show as-is
@@ -84,12 +154,24 @@ interface GalleryNotification {
     names: string[];
     llmTitle: string;
     llmBody: string;
+    /** llmSubtitle of the source notification — needed by clients that
+     *  reconstruct the grouping-LLM input text (e.g. burst extraction). */
+    subtitle: string;
+    /** Long-form description used by the production grouping prompt. May be
+     *  empty when the source notification was buffered before description
+     *  generation completed. */
+    detailedDescription?: string;
     thumbnailUrl: string;
     hasEmbedding: boolean;
     groupId?: string;
     groupSize?: number;
     llmIdentifiedName?: string;
     llmIdentifiedNames?: string[];
+    /** True = Scrypted native Summary/Story digest; drives the gallery Story badge. */
+    isSummary?: boolean;
+    /** Instant to seek the NVR to — the same one the poster used. Differs from
+     *  `timestamp` (our handling time) by minutes on a Story. */
+    seekTimestamp?: number;
 }
 
 interface GalleryPageResult {
@@ -104,6 +186,13 @@ interface GalleryPageResult {
     };
     groupTitle?: string;
     groupMemberCount?: number;
+    // Group hero view metadata — only set on drill-down responses.
+    groupId?: string;
+    groupBody?: string;
+    groupHeroUrl?: string;
+    groupStartMs?: number;
+    groupDurationMs?: number;
+    groupPrimaryId?: string;
 }
 
 export function getGalleryPage(
@@ -123,11 +212,38 @@ export function getGalleryPage(
     let groupMemberCount: number | undefined;
     let groupSizesMap: Map<string, number> | undefined;
 
+    let groupBody: string | undefined;
+    let groupHeroUrl: string | undefined;
+    let groupStartMs: number | undefined;
+    let groupDurationMs: number | undefined;
+
     if (isDrillDown) {
         working = notifications.filter(n => n.groupId === groupId);
         const primary = working.find(n => n.isGroupPrimary);
-        groupTitle = primary?.llmTitle;
+        // Prefer persisted LLM group title/body when set; fall back to primary's own
+        // event-level fields for backward compat with groups created before persistence.
+        groupTitle = primary?.llmGroupTitle ?? primary?.llmTitle;
+        groupBody = primary?.llmGroupBody ?? primary?.llmBody;
         groupMemberCount = working.length;
+
+        if (working.length > 0) {
+            const timestamps = working.map(n => n.timestamp);
+            groupStartMs = Math.min(...timestamps);
+            groupDurationMs = Math.max(...timestamps) - groupStartMs;
+        }
+
+        if (groupId) {
+            const base = baseUrl || '';
+            // Composite poster files were produced by the deleted
+            // v0.3.83-v0.3.116 grouping pipeline; no `group-*` posters get
+            // written anymore. Point drill-down hero at the primary's
+            // per-event poster instead (empty string if the primary has no
+            // poster on disk). Phase 8 migration removes drill-down entirely.
+            const primaryRec = working.find(n => n.isGroupPrimary);
+            groupHeroUrl = primaryRec?.hasPoster
+                ? `${base}/brief/snapshot?id=${encodeURIComponent(primaryRec.id)}`
+                : '';
+        }
     } else {
         // Compute group sizes before collapsing (count members per groupId)
         groupSizesMap = new Map<string, number>();
@@ -141,16 +257,38 @@ export function getGalleryPage(
         working = collapseByGroup(notifications);
     }
 
-    // Collect filter options
+    // Per-group name union — used in the flat-list to surface all identified
+    // names on the card badge, in the filter dropdown, and as the predicate
+    // for the name filter — not just the primary's (v0.3.129).
+    const groupNamesIndex = isDrillDown ? undefined : buildGroupNamesIndex(notifications);
+
+    // Helpers that fold the group union into the per-notification name views.
+    const effectiveScryptedNames = (n: StoredNotification): string[] => {
+        if (!isDrillDown && n.groupId) {
+            const e = groupNamesIndex?.get(n.groupId);
+            if (e) return e.names;
+        }
+        return n.names || [];
+    };
+    const effectiveLlmNames = (n: StoredNotification): string[] => {
+        if (!isDrillDown && n.groupId) {
+            const e = groupNamesIndex?.get(n.groupId);
+            if (e) return e.llmIdentifiedNames;
+        }
+        return n.llmIdentifiedNames || (n.llmIdentifiedName ? [n.llmIdentifiedName] : []);
+    };
+
+    // Collect filter options — uses the effective name views so a name
+    // identified only by a non-primary group member still appears in the
+    // dropdown and is reachable via filtering.
     const cameraSet = new Set<string>();
     const typeSet = new Set<string>();
     const nameSet = new Set<string>();
     for (const n of working) {
         cameraSet.add(n.cameraName);
         typeSet.add(n.detectionType);
-        for (const name of n.names) nameSet.add(name);
-        const llmNames = n.llmIdentifiedNames || (n.llmIdentifiedName ? [n.llmIdentifiedName] : []);
-        for (const name of llmNames) nameSet.add(name);
+        for (const name of effectiveScryptedNames(n)) nameSet.add(name);
+        for (const name of effectiveLlmNames(n)) nameSet.add(name);
     }
 
     // Apply filters
@@ -162,10 +300,10 @@ export function getGalleryPage(
         filtered = filtered.filter(n => n.detectionType === filters.type);
     }
     if (filters.name) {
-        filtered = filtered.filter(n => {
-            const llmNames = n.llmIdentifiedNames || (n.llmIdentifiedName ? [n.llmIdentifiedName] : []);
-            return n.names.includes(filters.name!) || llmNames.includes(filters.name!);
-        });
+        filtered = filtered.filter(n =>
+            effectiveScryptedNames(n).includes(filters.name!) ||
+            effectiveLlmNames(n).includes(filters.name!),
+        );
     }
 
     // Sort newest first (storage order may be chronological after JSONL migration)
@@ -176,22 +314,33 @@ export function getGalleryPage(
     const paged = filtered.slice(start, start + pageSize);
 
     const base = baseUrl || '';
-    const galleryNotifications: GalleryNotification[] = paged.map(n => ({
-        id: n.id,
-        timestamp: n.timestamp,
-        cameraId: n.cameraId,
-        cameraName: n.cameraName,
-        detectionType: n.detectionType,
-        names: n.names,
-        llmTitle: n.llmTitle,
-        llmBody: n.llmBody,
-        thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
-        hasEmbedding: embeddings ? embeddings.has(n.id) : false,
-        groupId: n.groupId,
-        groupSize: isDrillDown ? undefined : (n.groupId && groupSizesMap ? groupSizesMap.get(n.groupId) : undefined),
-        llmIdentifiedName: n.llmIdentifiedName,
-        llmIdentifiedNames: n.llmIdentifiedNames,
-    }));
+    const galleryNotifications: GalleryNotification[] = paged.map(n => {
+        const gs = isDrillDown ? undefined : (n.groupId && groupSizesMap ? groupSizesMap.get(n.groupId) : undefined);
+        // For grouped primaries (gs > 1), badge names come from the union
+        // across all members so a face IDed by any member shows on the card.
+        const useGroupNames = !isDrillDown && !!n.groupId && (gs ?? 0) > 1;
+        const groupEntry = useGroupNames ? groupNamesIndex?.get(n.groupId!) : undefined;
+        return {
+            id: n.id,
+            timestamp: n.timestamp,
+            cameraId: n.cameraId,
+            cameraName: n.cameraName,
+            detectionType: n.detectionType,
+            names: groupEntry?.names ?? n.names,
+            llmTitle: n.llmTitle,
+            llmBody: n.llmBody,
+            subtitle: n.llmSubtitle,
+            detailedDescription: n.detailedDescription,
+            thumbnailUrl: buildThumbnailUrl(n, base, { isDrillDown, groupSize: gs }),
+            hasEmbedding: embeddings ? embeddings.has(n.id) : false,
+            groupId: n.groupId,
+            groupSize: gs,
+            llmIdentifiedName: n.llmIdentifiedName,
+            llmIdentifiedNames: groupEntry?.llmIdentifiedNames ?? n.llmIdentifiedNames,
+            isSummary: n.isSummary,
+            seekTimestamp: n.seekTimestamp,
+        };
+    });
 
     const result: GalleryPageResult = {
         notifications: galleryNotifications,
@@ -206,8 +355,17 @@ export function getGalleryPage(
     };
 
     if (isDrillDown) {
+        result.groupId = groupId;
         result.groupTitle = groupTitle;
         result.groupMemberCount = groupMemberCount;
+        result.groupBody = groupBody;
+        result.groupHeroUrl = groupHeroUrl;
+        result.groupStartMs = groupStartMs;
+        result.groupDurationMs = groupDurationMs;
+        const primary = working.find(n => n.isGroupPrimary);
+        if (primary) {
+            result.groupPrimaryId = primary.id;
+        }
     }
 
     return result;
@@ -317,7 +475,14 @@ export async function semanticSearch(
                 names: n.names,
                 llmTitle: n.llmTitle,
                 llmBody: n.llmBody,
+                subtitle: n.llmSubtitle,
+                detailedDescription: n.detailedDescription,
                 thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+        // Search results render through the SAME card renderer as normal
+        // browsing, so they need the seek anchor and the Story flag too —
+        // omitting them silently fell back to our handling time.
+        seekTimestamp: n.seekTimestamp,
+        isSummary: n.isSummary,
                 hasEmbedding: embeddings.has(n.id),
                 llmIdentifiedName: n.llmIdentifiedName,
                 llmIdentifiedNames: n.llmIdentifiedNames,
@@ -376,7 +541,14 @@ export async function semanticSearch(
             names: n.names,
             llmTitle: n.llmTitle,
             llmBody: n.llmBody,
+            subtitle: n.llmSubtitle,
+            detailedDescription: n.detailedDescription,
             thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+        // Search results render through the SAME card renderer as normal
+        // browsing, so they need the seek anchor and the Story flag too —
+        // omitting them silently fell back to our handling time.
+        seekTimestamp: n.seekTimestamp,
+        isSummary: n.isSummary,
             hasEmbedding: true,
             llmIdentifiedName: n.llmIdentifiedName,
             llmIdentifiedNames: n.llmIdentifiedNames,
@@ -473,7 +645,14 @@ export async function handleGallerySearchRequest(
         names: n.names,
         llmTitle: n.llmTitle,
         llmBody: n.llmBody,
+        subtitle: n.llmSubtitle,
+        detailedDescription: n.detailedDescription,
         thumbnailUrl: n.hasPoster ? `${base}/brief/snapshot?id=${encodeURIComponent(n.id)}` : '',
+        // Search results render through the SAME card renderer as normal
+        // browsing, so they need the seek anchor and the Story flag too —
+        // omitting them silently fell back to our handling time.
+        seekTimestamp: n.seekTimestamp,
+        isSummary: n.isSummary,
         hasEmbedding: embeddings.has(n.id),
         llmIdentifiedName: n.llmIdentifiedName,
         llmIdentifiedNames: n.llmIdentifiedNames,

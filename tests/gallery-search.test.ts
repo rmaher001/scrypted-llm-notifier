@@ -369,6 +369,34 @@ describe('handleGallerySearchRequest fallback', () => {
         expect(parsed.results[0].id).toBe('lexus-1');
     });
 
+    test('keyword fallback results include subtitle and detailedDescription (regression for B2 review finding)', async () => {
+        // The keyword-fallback mapper at the bottom of handleGallerySearchRequest
+        // historically omitted subtitle and detailedDescription from its result
+        // objects. Burst-extraction clients of /brief/gallery/search depend on
+        // those fields to reconstruct the production grouping prompt.
+        const n = makeNotification({
+            id: 'kw-1',
+            llmTitle: 'Person in garage',
+            llmSubtitle: 'Person • Garage',
+            llmBody: 'Walking past two grey Lexus SUVs',
+            detailedDescription: 'A man in a blue jacket walks past two grey Lexus SUVs in the garage.',
+        });
+        const mockStore = {
+            getAll: () => [n],
+            getAllEmbeddings: () => new Map(),
+        } as unknown as NotificationStore;
+
+        const result = await handleGallerySearchRequest(
+            JSON.stringify({ query: 'Lexus garage' }),
+            mockStore, '', 3, undefined, // no gemini → straight keyword path
+        );
+        const parsed = JSON.parse(result.body);
+        expect(parsed.mode).toBe('keyword');
+        expect(parsed.results[0].subtitle).toBe('Person • Garage');
+        expect(parsed.results[0].detailedDescription)
+            .toBe('A man in a blue jacket walks past two grey Lexus SUVs in the garage.');
+    });
+
     test('falls back to keyword when semantic results are empty due to no matching embeddings', async () => {
         // Two notifications: one with embedding, one without
         const n1 = makeNotification({

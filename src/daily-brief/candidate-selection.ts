@@ -97,7 +97,7 @@ export function prioritySelectFromBucket(
     };
 
     // Priority 1: Named people (not generic "Person", "Man", "Woman")
-    // Match names like "Richard in garage" or "Zoia at kitchen" - capitalized name followed by space or end
+    // Match names like "Alex in garage" or "Casey at kitchen" - capitalized name followed by space or end
     const namedPeople = groupAware.filter(n =>
         n.llmTitle &&
         /^[A-Z][a-z]+(\s|$)/.test(n.llmTitle) &&
